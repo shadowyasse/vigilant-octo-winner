@@ -60,7 +60,8 @@ func has_model(model: String) -> bool:
 ##   part : String                       use only the named child node of a multi-object file
 ##   part_prefix : String                use every child node whose name starts with this
 ##   clip : AABB                         keep only triangles inside this box, given as 0..1 fractions of the
-##                                       model's bounds (after the pre-rotation); `clip_remove` inverts it
+##                                       model's bounds (after the pre-rotation); `clip_remove` inverts it,
+##                                       `clip_part` limits it to one mesh node, `clip_refit` re-measures after
 ##   anchor : String                     "bottom" (default), "center" or "top"
 ##   tint : Color                        multiplied into every albedo
 ##   grunge : float                      0..1 strength of a blotchy dirt layer
@@ -95,9 +96,12 @@ func instance(model: String, options: Dictionary = {}) -> Node3D:
 	_collect_meshes(content, meshes)
 	var bounds := _measure(content, meshes, pre_rotation)
 	if options.has("clip") and bounds.size.length() > 0.000001:
-		var clip_key := "%s|%s|%s|%s|%s" % [path, options.get("part", ""), euler, options["clip"], options.get("clip_remove", false)]
-		_clip(content, meshes, pre_rotation, bounds, options["clip"], options.get("clip_remove", false), clip_key)
-		bounds = _measure(content, meshes, pre_rotation)
+		var clip_part: String = options.get("clip_part", "")
+		var clip_key := "%s|%s|%s|%s|%s|%s" % [path, options.get("part", ""), euler, options["clip"], options.get("clip_remove", false), clip_part]
+		_clip(content, meshes, pre_rotation, bounds, options["clip"], options.get("clip_remove", false), clip_part, clip_key)
+		# By default the model keeps the size and pivot it had before the cut.
+		if options.get("clip_refit", false):
+			bounds = _measure(content, meshes, pre_rotation)
 	if bounds.size.length() < 0.000001:
 		push_warning("ModelLoader: %s has no measurable geometry" % path)
 		bounds = AABB(Vector3(-0.5, 0.0, -0.5), Vector3.ONE)
@@ -105,6 +109,12 @@ func instance(model: String, options: Dictionary = {}) -> Node3D:
 	var scale_vector := _solve_scale(bounds.size, options)
 	var size := bounds.size * scale_vector
 	var center := bounds.get_center() * scale_vector
+	var rig := _find_skeleton(content)
+	if rig and rig.get_bone_count() > 0:
+		# Rigs stand on their root bone; helper bones (IK poles) must not shift the pivot.
+		var root_at := (Transform3D(pre_rotation, Vector3.ZERO) * content.transform * _relative_transform(rig, content)) * rig.get_bone_global_rest(0).origin
+		center.x = root_at.x * scale_vector.x
+		center.z = root_at.z * scale_vector.z
 	var anchor: String = options.get("anchor", "bottom")
 	var offset := Vector3(-center.x, -bounds.position.y * scale_vector.y, -center.z)
 	var normalized := AABB(Vector3(-size.x * 0.5, 0.0, -size.z * 0.5), size)
@@ -344,7 +354,7 @@ func _clear_owner(node: Node) -> void:
 ## Rebuilds every mesh keeping only the triangles whose centre lies inside (or,
 ## with `remove`, outside) `region`, a box in 0..1 fractions of `bounds`.
 func _clip(content: Node3D, meshes: Array[MeshInstance3D], pre_rotation: Basis, bounds: AABB, region: AABB,
-		remove: bool, cache_key: String) -> void:
+		remove: bool, only_part: String, cache_key: String) -> void:
 	if _clipped.has(cache_key):
 		var cached: Array = _clipped[cache_key]
 		for index in mini(cached.size(), meshes.size()):
@@ -354,6 +364,9 @@ func _clip(content: Node3D, meshes: Array[MeshInstance3D], pre_rotation: Basis, 
 	var safe_size := bounds.size.max(Vector3.ONE * 0.000001)
 	var results: Array = []
 	for mesh_instance in meshes:
+		if not only_part.is_empty() and String(mesh_instance.name) != only_part:
+			results.append(mesh_instance.mesh)
+			continue
 		var to_root := base * _relative_transform(mesh_instance, content)
 		var source := mesh_instance.mesh
 		var rebuilt := ArrayMesh.new()

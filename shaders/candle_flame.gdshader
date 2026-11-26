@@ -21,7 +21,7 @@ void vertex() {
 	vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), to_camera));
 	vec3 local = VERTEX;
 	// The tip leans with the draught, the base stays on the wick.
-	local.x += sway * 0.12 * (1.0 - UV.y);
+	local.x += sway * 0.012 * (1.0 - UV.y);
 	local.y *= 1.0 + 0.08 * sin(TIME * flicker_speed * 2.3 + seed * 9.0);
 	vec3 world = origin + right * local.x * scale.x + vec3(0.0, 1.0, 0.0) * local.y * scale.y;
 	VERTEX = (inverse(MODEL_MATRIX) * vec4(world, 1.0)).xyz;
