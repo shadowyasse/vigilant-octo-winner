@@ -11,12 +11,17 @@ Sources (all CC0 1.0 / public domain; licence is re-checked against each API):
   * Poly Haven  https://api.polyhaven.com   models (glTF packed into one .glb) and PBR textures
   * Poly Pizza  https://poly.pizza          .glb models by Quaternius, Kay Lousberg, CreativeTrio, iPoly3D
   * ambientCG   https://ambientcg.com/api   PBR textures
+  * vibeassets  https://vibeassets.io/api   rigged .glb characters (the demon)
 
 Nothing is fetched from a guessed URL: every download link comes out of the
 source's own API response for the asset id listed in the catalog below.
 Each file is checked for HTTP 200, a non-trivial size and the right magic
 bytes (glTF / JPEG / PNG), and the result is written to
 assets/asset_manifest.json.
+
+Rigged models listed in RIGGED_MODELS are also checked for a skin, skinned
+vertices and every bone the game maps by name; their bone hierarchy, rest
+positions and bounding box are printed and stored in the manifest.
 """
 
 from __future__ import annotations
@@ -138,7 +143,20 @@ MODEL_CATALOG = [
     ("exorcist", "polypizza", "Yg2bQZO6Hj", "characters"),
     ("gas_mask", "polyhaven", "old_gas_mask", "characters"),
     ("gas_canister", "polyhaven", "propane_tank", "characters"),
+    # --- The demon: skinned humanoid, drives the Stage 2 ragdoll ------------
+    ("demon", "vibeassets", "6lgzyditwz", "demon"),
 ]
+
+# Rigged models and the bones scripts/DemonSkeletonDriver.gd looks up by name.
+RIGGED_MODELS = {
+    "demon": [
+        "Hips", "Spine02", "Spine01", "Spine", "neck", "Head", "head_end",
+        "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
+        "RightShoulder", "RightArm", "RightForeArm", "RightHand",
+        "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase",
+        "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase",
+    ],
+}
 
 # (local name, source, source id)
 TEXTURE_CATALOG = [
@@ -257,6 +275,118 @@ def glb_summary(data: bytes) -> dict:
         "animations": len(document.get("animations", [])),
         "skins": len(document.get("skins", [])),
     }
+
+
+def _node_matrix(node: dict) -> list:
+    """Row-major 4x4 local transform of a glTF node."""
+    if "matrix" in node:
+        m = node["matrix"]
+        return [[m[column * 4 + row] for column in range(4)] for row in range(4)]
+    t = node.get("translation", [0.0, 0.0, 0.0])
+    x, y, z, w = node.get("rotation", [0.0, 0.0, 0.0, 1.0])
+    s = node.get("scale", [1.0, 1.0, 1.0])
+    r = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+    return [[r[i][0] * s[0], r[i][1] * s[1], r[i][2] * s[2], t[i]] for i in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+
+
+def _matrix_product(a: list, b: list) -> list:
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def glb_rig(data: bytes, required_bones: list) -> dict:
+    """Checks a skinned .glb and returns its bone hierarchy, rest pose and bounds.
+
+    Raises FetchError when there is no skin, no skinned vertices, a non-finite
+    rest transform or a bone the game needs is missing.
+    """
+    json_length = struct.unpack("<I", data[12:16])[0]
+    document = json.loads(data[20:20 + json_length].decode("utf-8"))
+    nodes = document.get("nodes", [])
+    skins = document.get("skins", [])
+    if not skins:
+        raise FetchError("model has no skin")
+    skin = skins[0]
+    joints = skin["joints"]
+    parent = {child: index for index, node in enumerate(nodes) for child in node.get("children", [])}
+    world: dict = {}
+
+    def world_of(index: int) -> list:
+        if index not in world:
+            local = _node_matrix(nodes[index])
+            world[index] = _matrix_product(world_of(parent[index]), local) if index in parent else local
+        return world[index]
+
+    joint_set = set(joints)
+    bones = []
+    for joint in joints:
+        matrix = world_of(joint)
+        rest = [matrix[0][3], matrix[1][3], matrix[2][3]]
+        if any(value != value or abs(value) == float("inf") for row in matrix for value in row):
+            raise FetchError("bone %s has a non-finite rest transform" % nodes[joint].get("name"))
+        above = parent.get(joint)
+        bones.append({
+            "name": nodes[joint].get("name", "joint_%d" % joint),
+            "parent": nodes[above].get("name", "") if above in joint_set else "",
+            "rest": [round(value, 4) for value in rest],
+            "rotation": [round(value, 4) for value in nodes[joint].get("rotation", [0.0, 0.0, 0.0, 1.0])],
+        })
+    names = {bone["name"] for bone in bones}
+    absent = [name for name in required_bones if name not in names]
+    if absent:
+        raise FetchError("skeleton is missing bones: %s" % ", ".join(absent))
+
+    vertices = 0
+    low = [float("inf")] * 3
+    high = [float("-inf")] * 3
+    for node in nodes:
+        if "mesh" not in node or "skin" not in node:
+            continue
+        for primitive in document["meshes"][node["mesh"]]["primitives"]:
+            attributes = primitive["attributes"]
+            if "JOINTS_0" not in attributes or "WEIGHTS_0" not in attributes:
+                raise FetchError("skinned mesh has no joint weights")
+            accessor = document["accessors"][attributes["POSITION"]]
+            vertices += accessor["count"]
+            for axis in range(3):
+                low[axis] = min(low[axis], accessor["min"][axis])
+                high[axis] = max(high[axis], accessor["max"][axis])
+    if vertices <= 0:
+        raise FetchError("skinned mesh has no vertices")
+    return {
+        "skeleton": skin.get("name", ""),
+        "joints": len(joints),
+        "vertices": vertices,
+        "bounds_min": [round(value, 4) for value in low],
+        "bounds_max": [round(value, 4) for value in high],
+        "height": round(high[1] - low[1], 4),
+        "bones": bones,
+    }
+
+
+def print_rig(record: dict) -> None:
+    """Bone tree with rest positions (metres, model space) and the bind-pose bounding box."""
+    rig = record["rig"]
+    entry = record["files"][0]
+    print("")
+    print("RIG %s  %s  %s  %d mesh(es), %d vertices, %d triangles, skeleton '%s' with %d bones" % (
+        record["name"], entry["path"], human(entry["bytes"]), record["meshes"], rig["vertices"],
+        record["triangles"], rig["skeleton"], rig["joints"]))
+    print("  bounding box  min (%.3f, %.3f, %.3f)  max (%.3f, %.3f, %.3f)  height %.3f m" % (
+        *rig["bounds_min"], *rig["bounds_max"], rig["height"]))
+    children: dict = {}
+    for bone in rig["bones"]:
+        children.setdefault(bone["parent"], []).append(bone)
+
+    def show(bone: dict, depth: int) -> None:
+        print("  %-26s rest (%7.3f, %7.3f, %7.3f)  local rotation (%.3f, %.3f, %.3f, %.3f)" % (
+            "  " * depth + bone["name"], *bone["rest"], *bone["rotation"]))
+        for child in children.get(bone["name"], []):
+            show(child, depth + 1)
+
+    for root in children.get("", []):
+        show(root, 0)
 
 
 def file_record(path: str, data: bytes, kind: str) -> dict:
@@ -389,6 +519,29 @@ def fetch_polypizza_model(public_id: str) -> tuple:
     return data, meta
 
 
+def fetch_vibeassets_model(asset_id: str) -> tuple:
+    info = http_json("https://vibeassets.io/api/asset/" + urllib.parse.quote(asset_id))["asset"]
+    licence = info.get("license", "")
+    if not licence.upper().replace(" ", "").startswith("CC0"):
+        raise FetchError("%s is %s, not CC0" % (info.get("page_url", asset_id), licence))
+    if info.get("format") != "glb":
+        raise FetchError("%s is %s, not a .glb" % (asset_id, info.get("format")))
+    url = info["download_url"]
+    data = http_get(url)
+    if info.get("size_bytes") and len(data) != int(info["size_bytes"]):
+        raise FetchError("%s: got %d bytes, the API lists %s" % (url, len(data), info["size_bytes"]))
+    meta = {
+        "source": "vibeassets",
+        "source_id": asset_id,
+        "source_page": info.get("page_url", "https://vibeassets.io/a/" + asset_id),
+        "title": info.get("title", asset_id),
+        "author": "vibeassets.io contributor (text-to-3D, auto-rigged)",
+        "license": "CC0 1.0",
+        "download_urls": [url],
+    }
+    return data, meta
+
+
 def fetch_polyhaven_texture(asset_id: str) -> tuple:
     info = polyhaven_info(asset_id, "textures")
     files = http_json("https://api.polyhaven.com/files/" + asset_id)
@@ -446,7 +599,7 @@ def fetch_ambientcg_texture(asset_id: str) -> tuple:
     return maps, meta
 
 
-MODEL_SOURCES = {"polyhaven": fetch_polyhaven_model, "polypizza": fetch_polypizza_model}
+MODEL_SOURCES = {"polyhaven": fetch_polyhaven_model, "polypizza": fetch_polypizza_model, "vibeassets": fetch_vibeassets_model}
 TEXTURE_SOURCES = {"polyhaven": fetch_polyhaven_texture, "ambientcg": fetch_ambientcg_texture}
 
 
@@ -476,8 +629,14 @@ def do_model(job: tuple, previous: dict, force: bool) -> dict:
         else:
             data, meta = MODEL_SOURCES[source](asset_id)
             record.update(meta)
+            # Validate before anything lands on disk.
+            glb_summary(data)
+            if name in RIGGED_MODELS:
+                glb_rig(data, RIGGED_MODELS[name])
             write_file(path, data)
         record.update(glb_summary(data))
+        if name in RIGGED_MODELS:
+            record["rig"] = glb_rig(data, RIGGED_MODELS[name])
         record["files"] = [file_record(path, data, "glb")]
     except (FetchError, KeyError, ValueError, OSError) as error:
         record["status"] = "failed"
@@ -566,6 +725,9 @@ def print_summary(models: list, textures: list) -> None:
         total = sum(entry["bytes"] for entry in record["files"])
         print("%-22s %-11s %-30s %10s  %s" % (record["name"], record["source"], record["title"][:30], human(total),
                 ", ".join(record["maps"])))
+    for record in models:
+        if record["status"] == "ok" and "rig" in record:
+            print_rig(record)
 
 
 def verify_offline() -> int:
@@ -586,6 +748,9 @@ def verify_offline() -> int:
                     raise FetchError("checksum mismatch")
                 if entry["format"] == "glb":
                     glb_summary(data)
+                    if record["name"] in RIGGED_MODELS:
+                        record["rig"] = glb_rig(data, RIGGED_MODELS[record["name"]])
+                        print_rig(record)
                 elif image_format(data) != entry["format"]:
                     raise FetchError("not a valid %s" % entry["format"])
             except (OSError, FetchError) as error:
