@@ -58,7 +58,7 @@ scripts/
   MaterialLibrary.gd     Cached procedural materials (noise-textured, glow, glass, shafts)
   FlickerLight.gd        Noise-driven flicker and brown-outs for any Light3D
   Player.gd              Movement, stamina, camera modes, headlamp, grab / throw, interaction
-  ExorcistModel.gd       Procedural hazmat exorcist and its procedural animation
+  ExorcistModel.gd       Rigged hazmat exorcist: skeletal clips plus procedural crouch, lean and arm IK
   HUD.gd                 Objective banner, stamina bar, gadget slots, prompts
   Crosshair.gd           Reactive reticle
 ```
@@ -82,6 +82,36 @@ scripts/
 - **Objectives** are steps in `GameState.STEPS`; world objects call
   `GameState.complete_step()` and the HUD follows `objective_changed`.
 - **Suit colours**: set `suit_variant` on the Main node (0 orange, 1 teal,
-  2 olive) or call `Player.set_suit()`.
+  2 olive, 3 purple) or call `Player.set_suit()`. The idle crew by the van takes the other three.
 - **Gadget slots** are empty in Stage 1; `HUD.set_gadget_slot(index, name)` is
   the hook for Stage 3.
+
+## Stage 1.5: visual overhaul
+
+- **Assets**: `tools/fetch_assets.py` downloads and verifies the CC0 `.glb` models and
+  1K PBR texture sets listed in `assets/asset_manifest.json`; everything lives under
+  `assets/`, so the game runs offline.
+- **Exorcist**: the rigged CC0 worker is re-dressed in code (suit fabric in four team
+  colours, split-out rubber gloves, full-face gas mask with glowing lenses, hardhat lamp,
+  harness, twin canisters, hose, belt). Idle / walk / run are skeletal clips; crouch,
+  airborne tuck, sprint lean, head pitch and arm reach are layered on by a
+  `SkeletonModifier3D` with two-bone IK.
+- **First person**: the same body stays visible with the head hidden; the gloves are
+  IK-posed in view with stride bob and look sway, and reach toward a grabbed prop.
+- **Grab tether**: a soft camera-facing thread from the right glove to a contact ring on
+  the grab point. It sags when slack and turns amber as the grip nears breaking.
+- **Lighting**: ACES, SSAO, SSIL, thresholded glow, volumetric fog (cold outside, a warm
+  `FogVolume` indoors), four-split moon shadows, and one shadow-tuning pass over every lamp
+  in `Main._tune_lights()`.
+
+## Checks
+
+```
+godot --headless --path . --import          # first run only: builds the import cache
+godot --headless --path . -s tools/smoke_test.gd
+```
+
+The smoke test boots the real game and plays the contract through the player's own
+input paths (F on the van doors, grab, haul up the ramp, throw, house triggers, V / T /
+Ctrl / Space). `tools/setup_sandbox.sh` installs Godot 4.3 and a software Vulkan stack
+for headless Linux machines.

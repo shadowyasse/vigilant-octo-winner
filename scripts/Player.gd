@@ -109,6 +109,10 @@ var _released: Array[Dictionary] = []
 var _shoulder_clearance := INF
 var _model_hidden := false
 var _tether: MeshInstance3D
+var _tether_mesh: ImmediateMesh
+var _tether_ring: MeshInstance3D
+var _tether_material: StandardMaterial3D
+var _held_strain := 0.0
 
 @onready var _collision: CollisionShape3D = $CollisionShape3D
 @onready var _model: ExorcistModel = $Model
@@ -132,6 +136,8 @@ func _ready() -> void:
 	_configure_flashlight()
 	_add_suit_glow()
 	_build_tether()
+	# The tether follows the hands, so it is redrawn once their final pose is known.
+	_model.pose_updated.connect(_update_tether)
 	stamina = max_stamina
 	first_person = start_in_first_person
 	_camera_blend = 0.0 if first_person else 1.0
@@ -146,7 +152,7 @@ func _exit_tree() -> void:
 	_release_held()
 
 
-## Chooses the hazmat colourway (0 orange, 1 teal, 2 olive; wraps).
+## Chooses the hazmat colourway (0 orange, 1 teal, 2 olive, 3 purple; wraps).
 func set_suit(index: int) -> void:
 	_model.apply_suit(index)
 
@@ -209,7 +215,8 @@ func _physics_process(delta: float) -> void:
 	_publish_aim()
 
 	var horizontal_speed := Vector2(velocity.x, velocity.z).length()
-	_model.set_motion(horizontal_speed, is_on_floor(), _crouch, _sprinting)
+	var backward := velocity.dot(global_transform.basis.z) > 0.5
+	_model.set_motion(horizontal_speed, is_on_floor(), _crouch, _sprinting, backward)
 	_model.set_look_pitch(_pitch)
 	if _holding and is_instance_valid(_held):
 		_model.set_reach(true, _held.global_transform * _held_local_point)
@@ -219,7 +226,6 @@ func _physics_process(delta: float) -> void:
 
 func _process(delta: float) -> void:
 	_update_camera_rig(delta)
-	_update_tether()
 
 
 # --- Locomotion -------------------------------------------------------------
@@ -324,6 +330,7 @@ func _update_camera_rig(delta: float) -> void:
 	# Slide the boom out over the right shoulder, but never through a wall.
 	_arm.position = (shoulder_offset * eased).limit_length(_shoulder_clearance)
 	_arm.spring_length = third_person_distance * eased
+	_model.set_view(_camera.global_transform)
 	# The torch shines from the hardhat lamp, along the line of sight.
 	_flashlight.global_position = _model.get_headlamp_position() - _head.global_transform.basis.z * 0.08
 	# The body would fill the lens up close, so hide it before the boom is fully in.
@@ -470,6 +477,7 @@ func _drive_held(_delta: float) -> void:
 	var lever := grab_point - _held.global_position
 	var target := _aim_origin + _aim_forward * _hold_distance
 	var error := target - grab_point
+	_held_strain = clampf(error.length() / break_distance, 0.0, 1.0)
 	if error.length() > break_distance:
 		_release_held()
 		return
@@ -519,51 +527,101 @@ func _expire_released(delta: float) -> void:
 
 # --- Grab tether --------------------------------------------------------------
 
-## A thin glowing binding line between the hand and the grab point. It makes
-## the invisible spring readable: you can see what you are hauling and how far
-## it is lagging behind.
+const TETHER_SEGMENTS := 18
+const TETHER_CALM := Color(0.45, 0.95, 0.85)
+const TETHER_STRAINED := Color(1.0, 0.55, 0.2)
+
+## A thin, soft binding thread from the glove to the grab point, with a small
+## ring where it bites. It sags when the prop hangs easy, pulls taut and warms
+## toward amber as the grip nears breaking, so the invisible spring is readable.
 func _build_tether() -> void:
-	var line := CylinderMesh.new()
-	line.top_radius = 0.008
-	line.bottom_radius = 0.008
-	line.height = 1.0
-	line.radial_segments = 6
-	line.rings = 1
-	var material := StandardMaterial3D.new()
-	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	material.albedo_color = Color(0.35, 1.0, 0.88)
-	material.emission_enabled = true
-	material.emission = Color(0.25, 0.95, 0.82)
-	material.emission_energy_multiplier = 2.5
+	_tether_material = StandardMaterial3D.new()
+	_tether_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	_tether_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_tether_material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	_tether_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	_tether_material.vertex_color_use_as_albedo = true
+	_tether_material.disable_fog = true
+	_tether_mesh = ImmediateMesh.new()
 	_tether = MeshInstance3D.new()
 	_tether.name = "GrabTether"
-	_tether.mesh = line
-	_tether.material_override = material
+	_tether.mesh = _tether_mesh
+	_tether.material_override = _tether_material
 	_tether.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_tether.top_level = true
 	_tether.visible = false
 	add_child(_tether)
 
+	var ring := TorusMesh.new()
+	ring.inner_radius = 0.03
+	ring.outer_radius = 0.037
+	ring.rings = 24
+	ring.ring_segments = 6
+	_tether_ring = MeshInstance3D.new()
+	_tether_ring.name = "GrabRing"
+	_tether_ring.mesh = ring
+	var ring_material := _tether_material.duplicate() as StandardMaterial3D
+	ring_material.vertex_color_use_as_albedo = false
+	_tether_ring.material_override = ring_material
+	_tether_ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_tether_ring.top_level = true
+	_tether_ring.visible = false
+	add_child(_tether_ring)
+
 
 func _update_tether() -> void:
 	var active := _holding and is_instance_valid(_held)
 	_tether.visible = active
+	_tether_ring.visible = active
 	if not active:
 		return
-	var from := _model.get_hand_position()
-	if _model_hidden:
-		# First person has no visible hands: start just below the right of the view.
-		from = _camera.global_transform * Vector3(0.24, -0.26, -0.5)
+	var from := _model.get_hand_position(1)
 	var to := _held.global_transform * _held_local_point
 	var span := to - from
 	var length := span.length()
 	if length < 0.02:
 		_tether.visible = false
 		return
-	# Stretch the unit cylinder (which runs along its local Y) between the two points.
-	var up := span / length
-	var side := up.cross(Vector3.UP)
-	if side.length_squared() < 0.0001:
-		side = Vector3.RIGHT
-	side = side.normalized()
-	_tether.global_transform = Transform3D(Basis(side, up * length, side.cross(up)), from + span * 0.5)
+	var color := TETHER_CALM.lerp(TETHER_STRAINED, smoothstep(0.35, 0.95, _held_strain))
+	# Slack hangs under the chord and trails behind a moving prop.
+	var slack := 1.0 - smoothstep(0.1, 0.7, _held_strain)
+	var control := from + span * 0.5 + Vector3.DOWN * (0.04 + 0.16 * slack) * clampf(length, 0.3, 1.4)
+	control -= (_held.linear_velocity * 0.035).limit_length(0.25)
+
+	# Camera-facing ribbon: bright core, edges fading to nothing.
+	var eye := _camera.global_position
+	var points: Array[Vector3] = []
+	for i in TETHER_SEGMENTS + 1:
+		var t := float(i) / TETHER_SEGMENTS
+		points.append(from.lerp(control, t).lerp(control.lerp(to, t), t))
+	_tether.global_transform = Transform3D.IDENTITY
+	_tether_mesh.clear_surfaces()
+	_tether_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	var edge := Color(color.r, color.g, color.b, 0.0)
+	for i in TETHER_SEGMENTS:
+		var corners: Array[Vector3] = []
+		var alphas: Array[float] = []
+		for end in 2:
+			var index := i + end
+			var point := points[index]
+			var tangent := (points[mini(index + 1, TETHER_SEGMENTS)] - points[maxi(index - 1, 0)]).normalized()
+			var side := tangent.cross(eye - point).normalized() * 0.011
+			corners.append_array([point - side, point, point + side])
+			# Fade in from the glove so the thread seems to leave the palm.
+			alphas.append(0.85 * smoothstep(0.0, 0.12, float(index) / TETHER_SEGMENTS))
+		for strip in 2:
+			var core_first := strip == 1
+			var quad := [corners[strip], corners[strip + 1], corners[strip + 4], corners[strip], corners[strip + 4], corners[strip + 3]]
+			var is_core := [core_first, not core_first, not core_first, core_first, not core_first, core_first]
+			var ends := [0, 0, 1, 0, 1, 1]
+			for corner in 6:
+				_tether_mesh.surface_set_color(Color(color.r, color.g, color.b, alphas[ends[corner]]) if is_core[corner] else edge)
+				_tether_mesh.surface_add_vertex(quad[corner])
+	_tether_mesh.surface_end()
+
+	# The contact ring faces back along the thread and breathes slightly.
+	var normal := (control - to).normalized()
+	var pulse := 1.0 + sin(Time.get_ticks_msec() * 0.006) * 0.08 + _held_strain * 0.35
+	var ring_basis := Basis(Quaternion(Vector3.UP, normal)).scaled(Vector3.ONE * pulse)
+	_tether_ring.global_transform = Transform3D(ring_basis, to + normal * 0.012)
+	(_tether_ring.material_override as StandardMaterial3D).albedo_color = Color(color.r, color.g, color.b, 0.7)
