@@ -103,6 +103,7 @@ static func rune_row(count: int, glyph_size: float, material: Material, seed_val
 
 
 ## Soft chalk material: lit by lamps and torches, with a faint glow so it reads in the dark.
+## A world-space noise breaks the strokes up, as if they had been scuffed and redrawn.
 static func chalk_material(color: Color, emission_energy: float) -> StandardMaterial3D:
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = color
@@ -111,7 +112,38 @@ static func chalk_material(color: Color, emission_energy: float) -> StandardMate
 	mat.emission_enabled = true
 	mat.emission = color
 	mat.emission_energy_multiplier = emission_energy
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.albedo_texture = _scuff_texture()
+	mat.uv1_triplanar = true
+	mat.uv1_world_triplanar = true
+	mat.uv1_scale = Vector3.ONE * 1.7
 	return mat
+
+
+static var _scuff: NoiseTexture2D
+
+
+## Speckled alpha: mostly solid, with worn patches and gritty edges.
+static func _scuff_texture() -> NoiseTexture2D:
+	if _scuff:
+		return _scuff
+	var noise := FastNoiseLite.new()
+	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	noise.frequency = 0.045
+	noise.fractal_octaves = 4
+	noise.fractal_gain = 0.7
+	noise.seed = 666
+	var ramp := Gradient.new()
+	ramp.offsets = PackedFloat32Array([0.0, 0.28, 0.5, 1.0])
+	ramp.colors = PackedColorArray([Color(0.7, 0.7, 0.7, 0.12), Color(0.85, 0.85, 0.85, 0.55), Color(1, 1, 1, 0.95), Color(1, 1, 1, 1)])
+	_scuff = NoiseTexture2D.new()
+	_scuff.width = 256
+	_scuff.height = 256
+	_scuff.seamless = true
+	_scuff.generate_mipmaps = true
+	_scuff.noise = noise
+	_scuff.color_ramp = ramp
+	return _scuff
 
 
 static func _begin() -> SurfaceTool:

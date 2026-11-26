@@ -1,224 +1,210 @@
 extends RefCounted
-## Builds the throwable clutter. Every prop is a RigidBody3D assembled from
-## primitive meshes, with mass, friction and bounce tuned per object so light
-## junk skitters when kicked and furniture has to be shouldered around.
-## All props are built with their origin on the floor, centred under them.
+## Builds the interactive clutter and furniture.
+##
+## Every prop is a RigidBody3D whose visual is a real .glb model normalised by
+## `ModelLoader` (origin on the floor, centred, facing -Z) and whose collider is
+## fitted to that model: a box for boxy things, a simplified convex hull for
+## round or irregular ones, and a seat + backrest pair for seating.
+## Mass, friction and bounce are tuned per object so paint cans clatter, books
+## slide, and a sofa has to be shouldered across the room.
 
 const Mats := preload("res://scripts/MaterialLibrary.gd")
 const FlickerLight := preload("res://scripts/FlickerLight.gd")
 
+const BOX := &"box"
+const CONVEX := &"convex"
+const SEAT := &"seat"
+
+## Slight overall darkening so bright scanned assets sit in the house palette.
+const HOUSE_TINT := Color(0.80, 0.78, 0.76)
 const BOOK_COLORS: Array[Color] = [
 	Color(0.45, 0.10, 0.10), Color(0.10, 0.22, 0.36), Color(0.14, 0.30, 0.16),
 	Color(0.36, 0.26, 0.10), Color(0.24, 0.12, 0.30), Color(0.12, 0.12, 0.13),
 ]
-const PAINT_COLORS: Array[Color] = [
-	Color(0.70, 0.08, 0.06), Color(0.85, 0.80, 0.70), Color(0.10, 0.35, 0.42), Color(0.90, 0.55, 0.08),
-]
+
+# kind -> recipe. Keys:
+#   label                      shown in the grab prompt
+#   model                      path under res://assets/models (without .glb)
+#   fit                        ModelLoader options (size, rotation, part ...)
+#   mass, friction, bounce     physics
+#   shape                      BOX, CONVEX or SEAT
+#   seat / back                SEAT only: seat height and backrest depth as fractions of the bounds
+#   damp                       angular damping (default 0.35)
+#   size                       stand-in size if the .glb is missing
+const RECIPES := {
+	# --- Seating ---------------------------------------------------------
+	&"chair": {"label": "Dining Chair", "model": "furniture/dining_chair", "fit": {"fit_height": 1.08, "rotate_y": 180.0},
+			"mass": 5.5, "friction": 0.7, "bounce": 0.1, "shape": SEAT, "seat": 0.44, "back": 0.2, "size": Vector3(0.5, 1.05, 0.5)},
+	&"gothic_chair": {"label": "Gothic Chair", "model": "furniture/gothic_chair", "fit": {"fit_height": 1.75, "rotate_y": 180.0},
+			"mass": 11.0, "friction": 0.75, "bounce": 0.05, "shape": SEAT, "seat": 0.3, "back": 0.22, "size": Vector3(0.55, 1.75, 0.5)},
+	&"armchair": {"label": "Armchair", "model": "furniture/armchair", "fit": {"fit_height": 1.05, "rotate_y": 180.0},
+			"mass": 24.0, "friction": 0.85, "bounce": 0.0, "shape": SEAT, "seat": 0.5, "back": 0.3, "damp": 0.7, "size": Vector3(0.85, 1.05, 0.8)},
+	&"green_chair": {"label": "Velvet Chair", "model": "furniture/green_chair", "fit": {"fit_height": 1.04, "rotate_y": 180.0},
+			"mass": 12.0, "friction": 0.8, "bounce": 0.05, "shape": SEAT, "seat": 0.46, "back": 0.25, "size": Vector3(0.66, 1.04, 0.66)},
+	&"rocking_chair": {"label": "Rocking Chair", "model": "furniture/rocking_chair", "fit": {"fit_height": 1.0, "rotate_y": 180.0},
+			"mass": 8.5, "friction": 0.6, "bounce": 0.1, "shape": SEAT, "seat": 0.45, "back": 0.25, "size": Vector3(0.7, 1.0, 0.8)},
+	&"sofa": {"label": "Moth-Eaten Sofa", "model": "furniture/sofa", "fit": {"fit_width": 1.95, "rotate_y": 180.0},
+			"mass": 46.0, "friction": 0.7, "bounce": 0.0, "shape": SEAT, "seat": 0.58, "back": 0.3, "damp": 0.8, "size": Vector3(1.95, 0.78, 0.88)},
+	&"wheelchair": {"label": "Wheelchair", "model": "props/wheelchair", "fit": {"fit_height": 1.0, "rotate_y": 180.0},
+			"mass": 15.0, "friction": 0.35, "bounce": 0.05, "shape": SEAT, "seat": 0.55, "back": 0.25, "size": Vector3(0.7, 1.0, 1.0)},
+	# --- Tables and case goods -------------------------------------------
+	&"table": {"label": "Dining Table", "model": "furniture/dining_table", "fit": {"stretch": Vector3(1.7, 0.76, 0.8)},
+			"mass": 24.0, "friction": 0.8, "bounce": 0.05, "shape": CONVEX, "size": Vector3(1.7, 0.76, 0.8)},
+	&"coffee_table": {"label": "Coffee Table", "model": "furniture/coffee_table", "fit": {"stretch": Vector3(1.1, 0.46, 0.8)},
+			"mass": 14.0, "friction": 0.8, "bounce": 0.05, "shape": CONVEX, "size": Vector3(1.1, 0.46, 0.8)},
+	&"round_table": {"label": "Round Table", "model": "furniture/round_table", "fit": {"fit_height": 0.78},
+			"mass": 19.0, "friction": 0.75, "bounce": 0.05, "shape": CONVEX, "size": Vector3(1.1, 0.78, 1.1)},
+	&"console_table": {"label": "Console Table", "model": "furniture/console_table", "fit": {"fit_width": 1.4, "rotate_y": 180.0},
+			"mass": 17.0, "friction": 0.75, "bounce": 0.05, "shape": CONVEX, "size": Vector3(1.4, 0.86, 0.55)},
+	&"desk": {"label": "Steel Desk", "model": "furniture/desk", "fit": {"fit_width": 1.75, "rotate_y": 180.0},
+			"mass": 58.0, "friction": 0.75, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(1.75, 0.7, 0.83)},
+	&"bookshelf": {"label": "Bookshelf", "model": "furniture/bookshelf", "fit": {"fit_height": 2.1, "rotate_y": 180.0},
+			"mass": 62.0, "friction": 0.85, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(1.4, 2.1, 0.58)},
+	&"cabinet": {"label": "Gothic Cabinet", "model": "furniture/gothic_cabinet", "fit": {"fit_height": 2.15, "rotate_y": 180.0},
+			"mass": 85.0, "friction": 0.9, "bounce": 0.0, "shape": BOX, "damp": 0.9, "size": Vector3(1.55, 2.15, 0.95)},
+	&"commode": {"label": "Commode", "model": "furniture/commode", "fit": {"fit_height": 1.1, "rotate_y": 180.0},
+			"mass": 42.0, "friction": 0.85, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(1.1, 1.1, 0.53)},
+	&"painted_cabinet": {"label": "Flaking Cabinet", "model": "furniture/painted_cabinet", "fit": {"fit_height": 1.1, "rotate_y": 180.0},
+			"mass": 34.0, "friction": 0.85, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(1.1, 1.1, 0.58)},
+	&"sideboard": {"label": "Sideboard", "model": "furniture/sideboard", "fit": {"fit_height": 0.86, "rotate_y": 180.0},
+			"mass": 36.0, "friction": 0.85, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(1.38, 0.86, 0.6)},
+	&"nightstand": {"label": "Nightstand", "model": "furniture/nightstand", "fit": {"fit_height": 0.68, "rotate_y": 180.0},
+			"mass": 9.0, "friction": 0.75, "bounce": 0.05, "shape": BOX, "size": Vector3(0.55, 0.68, 0.41)},
+	&"grandfather_clock": {"label": "Grandfather Clock", "model": "furniture/grandfather_clock", "fit": {"fit_height": 2.15, "rotate_y": 180.0},
+			"mass": 44.0, "friction": 0.85, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(0.62, 2.15, 0.42)},
+	# --- Lamps -----------------------------------------------------------
+	&"lamp": {"label": "Floor Lamp", "model": "lighting/floor_lamp", "fit": {"fit_height": 1.72},
+			"mass": 4.2, "friction": 0.75, "bounce": 0.1, "shape": CONVEX, "damp": 0.5, "size": Vector3(0.42, 1.72, 0.42)},
+	&"lantern": {"label": "Wooden Lantern", "model": "lighting/wooden_lantern", "fit": {"fit_height": 0.5},
+			"mass": 1.8, "friction": 0.7, "bounce": 0.15, "shape": BOX, "size": Vector3(0.21, 0.5, 0.22)},
+	&"oil_lantern": {"label": "Kerosene Lantern", "model": "lighting/kerosene_lantern", "fit": {"fit_height": 0.36},
+			"mass": 1.1, "friction": 0.6, "bounce": 0.2, "shape": CONVEX, "size": Vector3(0.15, 0.36, 0.13)},
+	# --- Throwable clutter -----------------------------------------------
+	&"box": {"label": "Cardboard Box", "model": "props/cardboard_box", "fit": {},
+			"mass": 2.4, "friction": 0.62, "bounce": 0.05, "shape": BOX, "damp": 0.6, "size": Vector3(0.5, 0.4, 0.5)},
+	&"crate": {"label": "Wooden Crate", "model": "props/wooden_crate", "fit": {"stretch": Vector3(0.78, 0.5, 0.52)},
+			"mass": 11.0, "friction": 0.75, "bounce": 0.05, "shape": BOX, "size": Vector3(0.78, 0.5, 0.52)},
+	&"book": {"label": "Occult Tome", "model": "props/book_set", "fit": {"rotation": Vector3(0.0, 0.0, 90.0), "stretch": Vector3(0.26, 0.05, 0.19)},
+			"mass": 0.6, "friction": 0.55, "bounce": 0.05, "shape": BOX, "damp": 0.8, "size": Vector3(0.26, 0.05, 0.19)},
+	&"tv": {"label": "Old Television", "model": "props/television", "fit": {"fit_width": 0.66, "rotate_y": 180.0},
+			"mass": 13.0, "friction": 0.7, "bounce": 0.05, "shape": BOX, "size": Vector3(0.66, 0.5, 0.52)},
+	&"radio": {"label": "Boombox", "model": "props/boombox", "fit": {"fit_width": 0.66, "rotate_y": 180.0},
+			"mass": 3.6, "friction": 0.65, "bounce": 0.1, "shape": BOX, "size": Vector3(0.66, 0.43, 0.18)},
+	&"bottle": {"label": "Wine Bottle", "model": "props/wine_bottles", "fit": {"fit_height": 0.32},
+			"mass": 1.2, "friction": 0.45, "bounce": 0.25, "shape": CONVEX, "damp": 0.2, "size": Vector3(0.08, 0.32, 0.08)},
+	&"paint_can": {"label": "Paint Can", "model": "props/paint_can", "fit": {"fit_height": 0.2},
+			"mass": 3.4, "friction": 0.5, "bounce": 0.2, "shape": CONVEX, "damp": 0.15, "size": Vector3(0.17, 0.2, 0.17)},
+	&"spray_can": {"label": "Spray Can", "model": "props/spray_cans", "fit": {"fit_height": 0.22},
+			"mass": 0.45, "friction": 0.45, "bounce": 0.3, "shape": CONVEX, "damp": 0.15, "size": Vector3(0.07, 0.22, 0.07)},
+	&"bucket": {"label": "Wooden Bucket", "model": "props/bucket", "fit": {"fit_height": 0.46},
+			"mass": 2.6, "friction": 0.65, "bounce": 0.15, "shape": CONVEX, "size": Vector3(0.32, 0.46, 0.3)},
+	&"toolbox": {"label": "Toolbox", "model": "props/toolbox", "fit": {"fit_width": 0.46, "rotate_y": 180.0},
+			"mass": 7.0, "friction": 0.6, "bounce": 0.1, "shape": BOX, "size": Vector3(0.46, 0.4, 0.33)},
+	&"tool_chest": {"label": "Tool Chest", "model": "props/tool_chest", "fit": {"fit_width": 0.66, "rotate_y": 180.0},
+			"mass": 16.0, "friction": 0.6, "bounce": 0.05, "shape": BOX, "size": Vector3(0.66, 0.62, 0.4)},
+	&"picture": {"label": "Framed Painting", "model": "props/picture_landscape", "fit": {"fit_width": 0.72, "rotate_y": 180.0},
+			"mass": 2.2, "friction": 0.6, "bounce": 0.1, "shape": BOX, "size": Vector3(0.72, 0.55, 0.05)},
+	&"skull": {"label": "Skull", "model": "props/skull", "fit": {"fit_height": 0.21, "rotate_y": 180.0},
+			"mass": 0.9, "friction": 0.5, "bounce": 0.25, "shape": CONVEX, "damp": 0.2, "size": Vector3(0.2, 0.21, 0.22)},
+	&"goblet": {"label": "Brass Goblet", "model": "props/goblets", "fit": {"fit_height": 0.2},
+			"mass": 0.5, "friction": 0.45, "bounce": 0.3, "shape": CONVEX, "damp": 0.2, "size": Vector3(0.1, 0.2, 0.1)},
+	&"bust": {"label": "Marble Bust", "model": "props/marble_bust", "fit": {"fit_height": 0.52, "rotate_y": 180.0},
+			"mass": 14.0, "friction": 0.6, "bounce": 0.05, "shape": CONVEX, "size": Vector3(0.28, 0.52, 0.3)},
+	# --- Yard ------------------------------------------------------------
+	&"cone": {"label": "Traffic Cone", "model": "yard/traffic_cone", "fit": {"fit_height": 0.62},
+			"mass": 1.3, "friction": 0.8, "bounce": 0.25, "shape": CONVEX, "damp": 0.4, "size": Vector3(0.36, 0.62, 0.36)},
+	&"tyre": {"label": "Bald Tyre", "model": "yard/old_tyre", "fit": {"rotation": Vector3(90.0, 0.0, 0.0), "fit_width": 0.62},
+			"mass": 8.5, "friction": 0.9, "bounce": 0.4, "shape": CONVEX, "size": Vector3(0.62, 0.17, 0.62)},
+	&"trash_can": {"label": "Dustbin", "model": "yard/trash_can", "fit": {"part_prefix": "metal_trash_can_rust", "fit_height": 0.86},
+			"mass": 6.0, "friction": 0.55, "bounce": 0.2, "shape": CONVEX, "size": Vector3(0.55, 0.86, 0.55)},
+	&"generator": {"label": "Generator", "model": "yard/generator", "fit": {"fit_width": 0.8, "rotate_y": 180.0},
+			"mass": 44.0, "friction": 0.8, "bounce": 0.0, "shape": BOX, "damp": 0.8, "size": Vector3(0.8, 0.57, 0.55)},
+	&"hand_truck": {"label": "Hand Truck", "model": "yard/hand_truck", "fit": {"fit_height": 1.3, "rotate_y": 180.0},
+			"mass": 9.0, "friction": 0.5, "bounce": 0.1, "shape": CONVEX, "size": Vector3(0.55, 1.3, 0.64)},
+}
+
+const BOOK_PARTS := 20
+const BOTTLE_PARTS: Array[String] = ["wine_bottles_01_bordeaux", "wine_bottles_01_alsace", "wine_bottles_01_burgundy", "wine_bottles_01_champagne"]
+const SPRAY_PARTS: Array[String] = ["spray_paint_bottles", "spray_paint_bottles_dirty"]
+const GOBLET_PARTS: Array[String] = ["brass_goblet_01", "brass_goblet_02", "brass_goblet_03"]
 
 
-## Creates a prop by kind name. `lit` switches on the light of lamps and TVs.
+static func has_kind(kind: StringName) -> bool:
+	return RECIPES.has(kind)
+
+
+## Creates a prop by kind name. `lit` switches on the light of lamps, lanterns and TVs.
 static func create(kind: StringName, rng: RandomNumberGenerator, lit: bool = false) -> RigidBody3D:
+	if not RECIPES.has(kind):
+		push_error("PropFactory: unknown prop kind '%s'" % kind)
+		return null
+	var recipe: Dictionary = RECIPES[kind]
+	var fit: Dictionary = (recipe["fit"] as Dictionary).duplicate()
+	fit["fallback_size"] = recipe["size"]
+	if not fit.has("tint"):
+		fit["tint"] = HOUSE_TINT
+	var mass: float = recipe["mass"]
+
+	# Per-kind variation.
 	match kind:
-		&"chair":
-			return chair()
 		&"box":
-			return cardboard_box(rng)
-		&"crate":
-			return crate()
-		&"table":
-			return table(Vector3(1.3, 0.77, 0.75), 17.0, "Dining Table")
-		&"coffee_table":
-			return table(Vector3(0.95, 0.44, 0.55), 8.5, "Coffee Table")
-		&"lamp":
-			return floor_lamp(lit)
+			var size := Vector3(rng.randf_range(0.38, 0.7), rng.randf_range(0.3, 0.55), rng.randf_range(0.38, 0.6))
+			fit["stretch"] = size
+			fit["fallback_size"] = size
+			fit["rotate_y"] = 90.0 * float(rng.randi() % 4)
+			mass = clampf(size.x * size.y * size.z * 26.0, 1.4, 5.0)
 		&"book":
-			return book(rng)
-		&"paint_can":
-			return paint_can(rng)
-		&"sofa":
-			return sofa()
+			fit["part"] = "book_encyclopedia_set_01_book%02d" % (1 + rng.randi() % BOOK_PARTS)
+			fit["tint"] = BOOK_COLORS[rng.randi() % BOOK_COLORS.size()].lerp(Color.WHITE, 0.45)
+		&"bottle":
+			fit["part"] = BOTTLE_PARTS[rng.randi() % BOTTLE_PARTS.size()]
+		&"spray_can":
+			fit["part"] = SPRAY_PARTS[rng.randi() % SPRAY_PARTS.size()]
+		&"goblet":
+			fit["part"] = GOBLET_PARTS[rng.randi() % GOBLET_PARTS.size()]
+
+	var body := _body(recipe["label"], mass, recipe["friction"], recipe["bounce"], recipe.get("damp", 0.35))
+	var model := ModelLoader.instance(recipe["model"], fit)
+	model.name = "Model"
+	body.add_child(model)
+	_fit_collider(body, model, recipe)
+
+	match kind:
+		&"lamp":
+			_dress_floor_lamp(body, model, lit)
+		&"lantern", &"oil_lantern":
+			if lit:
+				_add_lantern_light(body, model)
 		&"tv":
-			return television(lit)
-		&"cone":
-			return traffic_cone()
-	push_error("PropFactory: unknown prop kind '%s'" % kind)
-	return null
-
-
-static func chair() -> RigidBody3D:
-	var body := _body("Wooden Chair", 5.5, 0.7, 0.1)
-	var wood := Mats.prop_wood()
-	_box(body, Vector3(0.44, 0.05, 0.44), Vector3(0.0, 0.46, 0.0), wood)
-	for x: float in [-0.19, 0.19]:
-		for z: float in [-0.19, 0.19]:
-			_box(body, Vector3(0.05, 0.44, 0.05), Vector3(x, 0.22, z), wood)
-		_box(body, Vector3(0.05, 0.5, 0.05), Vector3(x, 0.73, 0.195), wood, false)
-	_box(body, Vector3(0.38, 0.1, 0.03), Vector3(0.0, 0.9, 0.195), wood, false)
-	_box(body, Vector3(0.38, 0.08, 0.03), Vector3(0.0, 0.7, 0.195), wood, false)
-	var back := BoxShape3D.new()
-	back.size = Vector3(0.44, 0.5, 0.05)
-	_collider(body, back, Vector3(0.0, 0.73, 0.195))
+			if lit:
+				_add_tv_glow(body, model)
+		&"bookshelf":
+			_fill_bookshelf(body, model, rng)
 	return body
 
 
-static func cardboard_box(rng: RandomNumberGenerator) -> RigidBody3D:
-	var size := Vector3(rng.randf_range(0.38, 0.7), rng.randf_range(0.3, 0.55), rng.randf_range(0.38, 0.6))
-	var body := _body("Cardboard Box", clampf(size.x * size.y * size.z * 26.0, 1.4, 5.0), 0.62, 0.05, 0.6)
-	_box(body, size, Vector3(0.0, size.y * 0.5, 0.0), Mats.cardboard())
-	var tape := Mats.solid(Color(0.50, 0.38, 0.22), 0.5)
-	_box(body, Vector3(size.x * 0.16, 0.004, size.z + 0.004), Vector3(0.0, size.y + 0.002, 0.0), tape, false)
-	_box(body, Vector3(size.x * 0.16, size.y * 0.3, 0.004), Vector3(0.0, size.y * 0.85, size.z * 0.5 + 0.002), tape, false)
-	_box(body, Vector3(size.x * 0.16, size.y * 0.3, 0.004), Vector3(0.0, size.y * 0.85, -size.z * 0.5 - 0.002), tape, false)
-	return body
+# --- Colliders ---------------------------------------------------------------
 
-
-static func crate() -> RigidBody3D:
-	var body := _body("Wooden Crate", 11.0, 0.75, 0.05)
-	var size := 0.6
-	_box(body, Vector3.ONE * size, Vector3(0.0, size * 0.5, 0.0), Mats.prop_wood())
-	var frame := Mats.prop_wood_dark()
-	var edge := 0.06
-	for sx: float in [-1.0, 1.0]:
-		for sz: float in [-1.0, 1.0]:
-			_box(body, Vector3(edge, size + 0.01, edge), Vector3(sx * (size - edge) * 0.5, size * 0.5, sz * (size - edge) * 0.5) * Vector3(1.01, 1.0, 1.01), frame, false)
-	for y: float in [edge * 0.5, size - edge * 0.5]:
-		for side: float in [-1.0, 1.0]:
-			_box(body, Vector3(size + 0.012, edge, edge), Vector3(0.0, y, side * (size - edge) * 0.505), frame, false)
-			_box(body, Vector3(edge, edge, size + 0.012), Vector3(side * (size - edge) * 0.505, y, 0.0), frame, false)
-	return body
-
-
-## `size` is the overall footprint and height of the table.
-static func table(size: Vector3, table_mass: float, display_name: String) -> RigidBody3D:
-	var body := _body(display_name, table_mass, 0.8, 0.05)
-	var wood := Mats.prop_wood_dark()
-	var top_thickness := 0.06
-	var leg := 0.07
-	_box(body, Vector3(size.x, top_thickness, size.z), Vector3(0.0, size.y - top_thickness * 0.5, 0.0), wood)
-	var leg_height := size.y - top_thickness
-	for sx: float in [-1.0, 1.0]:
-		for sz: float in [-1.0, 1.0]:
-			_box(body, Vector3(leg, leg_height, leg), Vector3(sx * (size.x * 0.5 - leg), leg_height * 0.5, sz * (size.z * 0.5 - leg)), wood)
-	return body
-
-
-static func floor_lamp(lit: bool) -> RigidBody3D:
-	var body := _body("Floor Lamp", 4.2, 0.75, 0.1, 0.5)
-	# Weighted base: it stands on its own but topples when clipped.
-	body.center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
-	body.center_of_mass = Vector3(0.0, 0.28, 0.0)
-	var metal := Mats.metal_dark()
-	_frustum(body, 0.15, 0.17, 0.035, Vector3(0.0, 0.0175, 0.0), metal)
-	_frustum(body, 0.018, 0.018, 1.45, Vector3(0.0, 0.76, 0.0), metal, false)
-	var pole := BoxShape3D.new()
-	pole.size = Vector3(0.04, 1.45, 0.04)
-	_collider(body, pole, Vector3(0.0, 0.76, 0.0))
-	var shade_material: StandardMaterial3D
-	if lit:
-		shade_material = Mats.glow(Color(1.0, 0.72, 0.42), 1.6, true)
+static func _fit_collider(body: RigidBody3D, model: Node3D, recipe: Dictionary) -> void:
+	var shape: StringName = recipe["shape"]
+	if shape == SEAT:
+		# Seat block plus backrest slab, so things can rest on the cushion and
+		# the chair still snags on door frames by its back.
+		var seat: float = recipe["seat"]
+		var back: float = recipe["back"]
+		ModelLoader.add_box_fraction(body, model, Vector3(0.02, 0.0, 0.0), Vector3(0.98, seat, 1.0))
+		ModelLoader.add_box_fraction(body, model, Vector3(0.04, seat, 1.0 - back), Vector3(0.96, 1.0, 1.0))
+	elif shape == CONVEX:
+		ModelLoader.add_collision(body, model, ModelLoader.Collision.CONVEX)
 	else:
-		shade_material = Mats.solid(Color(0.55, 0.50, 0.40), 0.95)
-	_frustum(body, 0.11, 0.2, 0.26, Vector3(0.0, 1.55, 0.0), shade_material)
-	if lit:
-		var light := OmniLight3D.new()
-		light.name = "Bulb"
-		light.position = Vector3(0.0, 1.5, 0.0)
-		light.light_color = Color(1.0, 0.70, 0.40)
-		light.omni_range = 7.5
-		light.omni_attenuation = 1.4
-		light.shadow_enabled = true
-		light.shadow_bias = 0.06
-		light.light_volumetric_fog_energy = 1.5
-		body.add_child(light)
-		var flicker := FlickerLight.new()
-		flicker.base_energy = 2.4
-		flicker.flicker_amount = 0.35
-		flicker.speed = 5.0
-		flicker.dropout_rate = 0.12
-		flicker.glow_material = shade_material
-		flicker.glow_energy = 1.6
-		light.add_child(flicker)
-	return body
+		var collider := ModelLoader.add_collision(body, model, ModelLoader.Collision.BOX, 0.004)
+		# Paper-thin things (picture frames) still need something to stand on.
+		var box := collider.shape as BoxShape3D
+		if box:
+			box.size = box.size.max(Vector3.ONE * 0.045)
 
 
-static func book(rng: RandomNumberGenerator) -> RigidBody3D:
-	var body := _body("Occult Tome", 0.55, 0.55, 0.05, 0.8)
-	var cover := Mats.solid(BOOK_COLORS[rng.randi() % BOOK_COLORS.size()], 0.8)
-	var pages := Mats.solid(Color(0.80, 0.76, 0.64), 0.95)
-	var size := Vector3(0.17, 0.045, 0.24)
-	_box(body, Vector3(size.x, 0.006, size.z), Vector3(0.0, size.y - 0.003, 0.0), cover, false)
-	_box(body, Vector3(size.x, 0.006, size.z), Vector3(0.0, 0.003, 0.0), cover, false)
-	_box(body, Vector3(0.008, size.y, size.z), Vector3(-size.x * 0.5 + 0.004, size.y * 0.5, 0.0), cover, false)
-	_box(body, Vector3(size.x - 0.014, size.y - 0.012, size.z - 0.012), Vector3(0.004, size.y * 0.5, 0.0), pages, false)
-	var shape := BoxShape3D.new()
-	shape.size = size
-	_collider(body, shape, Vector3(0.0, size.y * 0.5, 0.0))
-	return body
-
-
-static func paint_can(rng: RandomNumberGenerator) -> RigidBody3D:
-	var body := _body("Paint Can", 3.4, 0.5, 0.2, 0.15)
-	var paint := Mats.solid(PAINT_COLORS[rng.randi() % PAINT_COLORS.size()], 0.6)
-	_frustum(body, 0.085, 0.085, 0.19, Vector3(0.0, 0.095, 0.0), Mats.metal_bare())
-	_frustum(body, 0.087, 0.087, 0.11, Vector3(0.0, 0.095, 0.0), paint, false)
-	_frustum(body, 0.089, 0.089, 0.012, Vector3(0.0, 0.19, 0.0), Mats.metal_bare(), false)
-	_frustum(body, 0.05, 0.05, 0.004, Vector3(0.0, 0.198, 0.0), paint, false)
-	return body
-
-
-static func sofa() -> RigidBody3D:
-	var body := _body("Moth-Eaten Sofa", 44.0, 0.7, 0.0, 0.8)
-	var fabric := Mats.upholstery()
-	_box(body, Vector3(2.0, 0.46, 0.85), Vector3(0.0, 0.23, 0.0), fabric)
-	_box(body, Vector3(2.0, 0.5, 0.22), Vector3(0.0, 0.71, 0.315), fabric)
-	for sx: float in [-1.0, 1.0]:
-		_box(body, Vector3(0.2, 0.26, 0.85), Vector3(sx * 0.9, 0.59, 0.0), fabric)
-		_box(body, Vector3(0.76, 0.1, 0.6), Vector3(sx * 0.4, 0.5, -0.1), fabric, false)
-	return body
-
-
-static func television(lit: bool) -> RigidBody3D:
-	var body := _body("Old Television", 13.0, 0.7, 0.05)
-	_box(body, Vector3(0.62, 0.5, 0.5), Vector3(0.0, 0.25, 0.0), Mats.solid(Color(0.14, 0.11, 0.09), 0.6))
-	var screen_material: StandardMaterial3D
-	if lit:
-		screen_material = Mats.glow(Color(0.55, 0.70, 0.95), 2.2, true)
-	else:
-		screen_material = Mats.glass_dark()
-	_box(body, Vector3(0.46, 0.34, 0.01), Vector3(-0.05, 0.27, -0.252), screen_material, false)
-	_box(body, Vector3(0.06, 0.3, 0.01), Vector3(0.24, 0.27, -0.252), Mats.metal_dark(), false)
-	for sx: float in [-1.0, 1.0]:
-		_box(body, Vector3(0.012, 0.45, 0.012), Vector3(sx * 0.1, 0.7, 0.1), Mats.metal_bare(), false, Vector3(0.0, 0.0, -sx * 0.45))
-	if lit:
-		var light := OmniLight3D.new()
-		light.name = "ScreenGlow"
-		light.position = Vector3(0.0, 0.3, -0.5)
-		light.light_color = Color(0.50, 0.66, 1.0)
-		light.omni_range = 5.0
-		light.omni_attenuation = 1.6
-		body.add_child(light)
-		var flicker := FlickerLight.new()
-		flicker.base_energy = 1.3
-		flicker.flicker_amount = 0.75
-		flicker.speed = 22.0
-		flicker.glow_material = screen_material
-		flicker.glow_energy = 2.2
-		light.add_child(flicker)
-	return body
-
-
-static func traffic_cone() -> RigidBody3D:
-	var body := _body("Traffic Cone", 1.3, 0.8, 0.25, 0.4)
-	var orange := Mats.solid(Color(0.95, 0.35, 0.05), 0.7)
-	_box(body, Vector3(0.36, 0.03, 0.36), Vector3(0.0, 0.015, 0.0), orange)
-	_frustum(body, 0.03, 0.13, 0.5, Vector3(0.0, 0.28, 0.0), orange)
-	_frustum(body, 0.072, 0.095, 0.1, Vector3(0.0, 0.33, 0.0), Mats.solid(Color(0.9, 0.9, 0.88), 0.5), false)
-	return body
-
-
-# --- Assembly helpers -------------------------------------------------------
-
-static func _body(display_name: String, body_mass: float, friction: float, bounce: float, angular_damping: float = 0.3) -> RigidBody3D:
+static func _body(display_name: String, body_mass: float, friction: float, bounce: float, angular_damping: float) -> RigidBody3D:
 	var body := RigidBody3D.new()
 	body.name = display_name.replace(" ", "").replace("-", "")
 	body.mass = body_mass
@@ -237,49 +223,120 @@ static func _body(display_name: String, body_mass: float, friction: float, bounc
 	return body
 
 
-static func _collider(body: RigidBody3D, shape: Shape3D, at: Vector3) -> void:
-	var collider := CollisionShape3D.new()
-	collider.shape = shape
-	collider.position = at
-	body.add_child(collider)
+# --- Dressing ----------------------------------------------------------------
+
+## Weighted base so the lamp stands on its own but topples when clipped, plus its bulb.
+static func _dress_floor_lamp(body: RigidBody3D, model: Node3D, lit: bool) -> void:
+	var bounds := ModelLoader.get_aabb(model)
+	body.center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
+	body.center_of_mass = Vector3(0.0, bounds.size.y * 0.16, 0.0)
+	if not lit:
+		return
+	var glow_material := Mats.glow(Color(1.0, 0.72, 0.42), 2.2, true)
+	var bulb := SphereMesh.new()
+	bulb.radius = 0.05
+	bulb.height = 0.1
+	var bulb_instance := MeshInstance3D.new()
+	bulb_instance.mesh = bulb
+	bulb_instance.material_override = glow_material
+	bulb_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	bulb_instance.position = Vector3(0.0, bounds.size.y * 0.86, 0.0)
+	body.add_child(bulb_instance)
+	var light := OmniLight3D.new()
+	light.name = "Bulb"
+	light.position = Vector3(0.0, bounds.size.y * 0.84, 0.0)
+	light.light_color = Color(1.0, 0.70, 0.40)
+	light.omni_range = 7.5
+	light.omni_attenuation = 1.4
+	light.shadow_enabled = true
+	light.shadow_bias = 0.08
+	light.shadow_normal_bias = 1.5
+	light.light_volumetric_fog_energy = 1.2
+	body.add_child(light)
+	_add_flicker(light, 2.4, 0.35, 5.0, 0.12, glow_material, 2.2)
 
 
-static func _box(body: RigidBody3D, size: Vector3, at: Vector3, material: Material, solid: bool = true, euler: Vector3 = Vector3.ZERO) -> void:
-	var mesh := BoxMesh.new()
-	mesh.size = size
-	var instance := MeshInstance3D.new()
-	instance.mesh = mesh
-	instance.material_override = material
-	instance.position = at
-	instance.rotation = euler
-	body.add_child(instance)
-	if solid:
-		var shape := BoxShape3D.new()
-		shape.size = size
-		_collider(body, shape, at)
+static func _add_lantern_light(body: RigidBody3D, model: Node3D) -> void:
+	var bounds := ModelLoader.get_aabb(model)
+	var flame := Mats.glow(Color(1.0, 0.62, 0.22), 4.0, true)
+	var wick := SphereMesh.new()
+	wick.radius = 0.018
+	wick.height = 0.06
+	var wick_instance := MeshInstance3D.new()
+	wick_instance.mesh = wick
+	wick_instance.material_override = flame
+	wick_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	wick_instance.position = Vector3(0.0, bounds.size.y * 0.45, 0.0)
+	body.add_child(wick_instance)
+	var light := OmniLight3D.new()
+	light.name = "Flame"
+	light.position = Vector3(0.0, bounds.size.y * 0.5, 0.0)
+	light.light_color = Color(1.0, 0.60, 0.26)
+	light.omni_range = 4.5
+	light.omni_attenuation = 1.5
+	light.light_volumetric_fog_energy = 0.8
+	body.add_child(light)
+	_add_flicker(light, 1.1, 0.5, 8.0, 0.0, flame, 4.0)
 
 
-## Cylinder or cone section. Collides as a convex hull, which rolls and stacks
-## far more reliably than a true cylinder shape.
-static func _frustum(body: RigidBody3D, top_radius: float, bottom_radius: float, height: float, at: Vector3, material: Material, solid: bool = true) -> void:
-	var mesh := CylinderMesh.new()
-	mesh.top_radius = top_radius
-	mesh.bottom_radius = bottom_radius
-	mesh.height = height
-	mesh.radial_segments = 14
-	mesh.rings = 1
-	var instance := MeshInstance3D.new()
-	instance.mesh = mesh
-	instance.material_override = material
-	instance.position = at
-	body.add_child(instance)
-	if solid:
-		var points := PackedVector3Array()
-		var sides := 10
-		for i in sides:
-			var angle := TAU * float(i) / float(sides)
-			points.append(Vector3(cos(angle) * top_radius, height * 0.5, sin(angle) * top_radius))
-			points.append(Vector3(cos(angle) * bottom_radius, -height * 0.5, sin(angle) * bottom_radius))
-		var shape := ConvexPolygonShape3D.new()
-		shape.points = points
-		_collider(body, shape, at)
+## Cold, stuttering screen glow in front of the set.
+static func _add_tv_glow(body: RigidBody3D, model: Node3D) -> void:
+	var bounds := ModelLoader.get_aabb(model)
+	var screen_material := Mats.glow(Color(0.55, 0.70, 0.95), 1.4, true)
+	screen_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	screen_material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	screen_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	screen_material.albedo_color = Color(0.30, 0.42, 0.62, 0.55)
+	var screen := QuadMesh.new()
+	screen.size = Vector2(bounds.size.x * 0.56, bounds.size.y * 0.62)
+	var screen_instance := MeshInstance3D.new()
+	screen_instance.mesh = screen
+	screen_instance.material_override = screen_material
+	screen_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	screen_instance.position = Vector3(-bounds.size.x * 0.1, bounds.size.y * 0.52, bounds.position.z - 0.004)
+	screen_instance.rotation.y = PI
+	body.add_child(screen_instance)
+	var light := OmniLight3D.new()
+	light.name = "ScreenGlow"
+	light.position = Vector3(0.0, bounds.size.y * 0.55, bounds.position.z - 0.45)
+	light.light_color = Color(0.50, 0.66, 1.0)
+	light.omni_range = 5.0
+	light.omni_attenuation = 1.6
+	light.light_volumetric_fog_energy = 0.6
+	body.add_child(light)
+	_add_flicker(light, 1.3, 0.75, 22.0, 0.0, screen_material, 1.4)
+
+
+## Rows of real encyclopedia volumes on the shelves; they ride along if the case is toppled.
+static func _fill_bookshelf(body: RigidBody3D, model: Node3D, rng: RandomNumberGenerator) -> void:
+	if ModelLoader.is_fallback(model) or not ModelLoader.has_model("props/book_set"):
+		return
+	var bounds := ModelLoader.get_aabb(model)
+	var shelves := 6
+	var usable := bounds.size.x * 0.8
+	for shelf in shelves:
+		if rng.randf() < 0.22:
+			continue
+		var row := ModelLoader.instance("props/book_set", {
+			"fit_height": bounds.size.y * 0.115,
+			"rotate_y": 180.0,
+			"tint": BOOK_COLORS[rng.randi() % BOOK_COLORS.size()].lerp(Color.WHITE, 0.5) * HOUSE_TINT,
+			"shadows": false,
+		})
+		var row_bounds := ModelLoader.get_aabb(row)
+		var slack := maxf(0.0, usable - row_bounds.size.x)
+		row.position = Vector3(rng.randf_range(-0.5, 0.5) * slack, bounds.size.y * (0.055 + 0.151 * float(shelf)), bounds.size.z * 0.05)
+		body.add_child(row)
+
+
+static func _add_flicker(light: Light3D, energy: float, amount: float, speed: float, dropout_rate: float,
+		glow_material: StandardMaterial3D, glow_energy: float) -> void:
+	var flicker := FlickerLight.new()
+	flicker.base_energy = energy
+	flicker.flicker_amount = amount
+	flicker.speed = speed
+	flicker.dropout_rate = dropout_rate
+	flicker.glow_material = glow_material
+	flicker.glow_energy = glow_energy
+	light.light_energy = energy
+	light.add_child(flicker)
