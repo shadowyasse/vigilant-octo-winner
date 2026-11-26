@@ -3,6 +3,8 @@ extends CharacterBody3D
 ##
 ## Movement: WASD, Shift sprint (stamina), Space jump, Ctrl crouch.
 ## Camera:   mouse look, V toggles first / third person, T toggles the headlamp.
+## Knockdown: a fast flying prop or a demon swipe floors the player for a couple
+##           of seconds: the view drops and rolls, they slide, drop what they hold.
 ## Hands:    hold LMB / E to grab a RigidBody3D with a spring-damped pull (the
 ##           body is never frozen, so it swings, snags on doorframes and feels
 ##           its weight), RMB to throw, F to use doors.
@@ -12,6 +14,8 @@ signal aim_changed(kind: int, prompt: String)
 signal held_changed(body: RigidBody3D)
 signal camera_mode_changed(first_person: bool)
 signal flashlight_toggled(enabled: bool)
+signal knocked_down(duration: float)
+signal recovered
 
 enum AimKind { NONE, GRABBABLE, INTERACTABLE, HOLDING }
 
@@ -23,7 +27,11 @@ const STAND_EYE := 1.62
 const CROUCH_EYE := 1.0
 const COYOTE_TIME := 0.12
 const JUMP_BUFFER := 0.12
-const AIM_MASK := 1 | 4 | 8  # world occludes; props and interactables are targets
+const AIM_MASK := 1 | 4 | 8 | 16  # world occludes; props, interactables and demon limbs are targets
+## Eye height while lying on the floor after a knockdown.
+const KNOCK_EYE := 0.38
+## Deceleration of a knocked-down player sliding across the floor.
+const KNOCK_SLIDE := 6.0
 
 @export_group("Movement")
 @export var walk_speed := 4.4
@@ -76,6 +84,14 @@ const AIM_MASK := 1 | 4 | 8  # world occludes; props and interactables are targe
 @export var flashlight_energy := 9.0
 @export var flashlight_range := 24.0
 
+@export_group("Knockdown")
+## A flying prop closing faster than this (m/s) floors the player.
+@export var knock_impact_speed := 6.5
+@export var knock_time_min := 1.6
+@export var knock_time_max := 2.2
+## Seconds after getting back up during which nothing can knock the player down again.
+@export var knock_immunity := 2.0
+
 var stamina := 100.0
 var first_person := false
 var flashlight_on := true
@@ -113,6 +129,18 @@ var _tether_mesh: ImmediateMesh
 var _tether_ring: MeshInstance3D
 var _tether_material: StandardMaterial3D
 var _held_strain := 0.0
+var _held_demon: Node
+var _carry_mass := 0.0
+var _pull_mass := 0.0
+var _pull_cap := 0.0
+var _eye_height := STAND_EYE
+var _knock_left := 0.0
+var _knock_blend := 0.0
+var _knock_roll := 1.0
+var _immune_left := 0.0
+var _trauma := 0.0
+var _shake_clock := 0.0
+var _hit_sensor: Area3D
 
 @onready var _collision: CollisionShape3D = $CollisionShape3D
 @onready var _model: ExorcistModel = $Model
@@ -125,7 +153,7 @@ var _held_strain := 0.0
 func _ready() -> void:
 	add_to_group(GameState.GROUP_PLAYER)
 	collision_layer = GameState.LAYER_PLAYER
-	collision_mask = GameState.LAYER_WORLD | GameState.LAYER_PROP | GameState.LAYER_INTERACT
+	collision_mask = GameState.LAYER_WORLD | GameState.LAYER_PROP | GameState.LAYER_INTERACT | GameState.LAYER_DEMON
 	floor_snap_length = 0.35
 	floor_max_angle = deg_to_rad(46.0)
 	floor_constant_speed = true
@@ -136,6 +164,7 @@ func _ready() -> void:
 	_configure_flashlight()
 	_add_suit_glow()
 	_build_tether()
+	_build_hit_sensor()
 	# The tether follows the hands, so it is redrawn once their final pose is known.
 	_model.pose_updated.connect(_update_tether)
 	stamina = max_stamina
@@ -204,7 +233,10 @@ func set_flashlight(enabled: bool) -> void:
 
 
 func _physics_process(delta: float) -> void:
-	var input := Input.get_vector(&"move_left", &"move_right", &"move_forward", &"move_back")
+	_update_knockdown(delta)
+	# Flat on the floor there is no steering.
+	var input := Vector2.ZERO if _knock_left > 0.0 else Input.get_vector(&"move_left", &"move_right", &"move_forward", &"move_back")
+	_refresh_grab_tuning()
 	_update_crouch(delta)
 	_update_stamina(delta, input)
 	_move(delta, input)
@@ -212,6 +244,7 @@ func _physics_process(delta: float) -> void:
 	_update_aim()
 	_update_grab(delta)
 	_expire_released(delta)
+	_check_prop_impacts()
 	_publish_aim()
 
 	var horizontal_speed := Vector2(velocity.x, velocity.z).length()
@@ -231,7 +264,7 @@ func _process(delta: float) -> void:
 # --- Locomotion -------------------------------------------------------------
 
 func _update_crouch(delta: float) -> void:
-	var wants := Input.is_action_pressed(&"crouch")
+	var wants := Input.is_action_pressed(&"crouch") or _knock_left > 0.0
 	if not wants and _crouch > 0.0:
 		# Stay down while there is no headroom to stand back up.
 		var headroom := STAND_HEIGHT - _capsule.height + 0.02
@@ -241,7 +274,7 @@ func _update_crouch(delta: float) -> void:
 	var height := lerpf(STAND_HEIGHT, CROUCH_HEIGHT, _crouch)
 	_capsule.height = height
 	_collision.position.y = height * 0.5
-	_head.position.y = lerpf(STAND_EYE, CROUCH_EYE, _crouch)
+	_eye_height = lerpf(STAND_EYE, CROUCH_EYE, _crouch)
 
 
 func _update_stamina(delta: float, input: Vector2) -> void:
@@ -266,7 +299,7 @@ func _update_stamina(delta: float, input: Vector2) -> void:
 func _move(delta: float, input: Vector2) -> void:
 	var on_floor := is_on_floor()
 	_coyote = COYOTE_TIME if on_floor else maxf(0.0, _coyote - delta)
-	_jump_buffer = JUMP_BUFFER if Input.is_action_just_pressed(&"jump") else maxf(0.0, _jump_buffer - delta)
+	_jump_buffer = JUMP_BUFFER if Input.is_action_just_pressed(&"jump") and _knock_left <= 0.0 else maxf(0.0, _jump_buffer - delta)
 
 	var speed := walk_speed
 	if _crouch > 0.5:
@@ -275,7 +308,7 @@ func _move(delta: float, input: Vector2) -> void:
 		speed = sprint_speed
 	if _holding and is_instance_valid(_held):
 		# Hauling something heavy slows the carrier down.
-		speed *= clampf(1.0 - (_held.mass - 6.0) / 70.0, 0.55, 1.0)
+		speed *= clampf(1.0 - (_carry_mass - 6.0) / 70.0, 0.55, 1.0)
 
 	var wish := (global_transform.basis * Vector3(input.x, 0.0, input.y))
 	wish.y = 0.0
@@ -284,6 +317,8 @@ func _move(delta: float, input: Vector2) -> void:
 	var rate := air_acceleration
 	if on_floor:
 		rate = ground_acceleration if wish.length_squared() > 0.001 else ground_deceleration
+		if _knock_left > 0.0:
+			rate = KNOCK_SLIDE
 	horizontal = horizontal.move_toward(wish * speed, rate * delta)
 	velocity.x = horizontal.x
 	velocity.z = horizontal.z
@@ -306,7 +341,7 @@ func _shove_bodies(intended: Vector3, delta: float) -> void:
 	for i in get_slide_collision_count():
 		var collision := get_slide_collision(i)
 		var body := collision.get_collider() as RigidBody3D
-		if body == null or body.freeze or (_holding and body == _held):
+		if body == null or body.freeze or (_holding and body == _held) or (_held_demon and _demon_of(body) == _held_demon):
 			continue
 		var normal := collision.get_normal()
 		if normal.y > 0.7:
@@ -324,7 +359,16 @@ func _shove_bodies(intended: Vector3, delta: float) -> void:
 # --- Camera -----------------------------------------------------------------
 
 func _update_camera_rig(delta: float) -> void:
-	_head.rotation.x = _pitch
+	_knock_blend = move_toward(_knock_blend, 1.0 if _knock_left > 0.0 else 0.0, delta * (5.0 if _knock_left > 0.0 else 2.4))
+	var down := smoothstep(0.0, 1.0, _knock_blend)
+	_trauma = maxf(0.0, _trauma - delta * 1.3)
+	_shake_clock += delta * 34.0
+	var jolt := Vector3(sin(_shake_clock * 1.13), sin(_shake_clock * 0.87 + 1.7), sin(_shake_clock * 1.41 + 0.6)) * _trauma * _trauma
+	# Knocked down, the view drops to the floorboards and rolls onto its side.
+	_head.position.y = lerpf(_eye_height, KNOCK_EYE, down)
+	_head.rotation = Vector3(_pitch * (1.0 - 0.6 * down) + jolt.x * 0.05, jolt.y * 0.03, _knock_roll * 1.05 * down + jolt.z * 0.06)
+	_camera.h_offset = jolt.y * 0.04
+	_camera.v_offset = jolt.x * 0.04
 	_camera_blend = move_toward(_camera_blend, 0.0 if first_person else 1.0, delta * 4.5)
 	var eased := smoothstep(0.0, 1.0, _camera_blend)
 	# Slide the boom out over the right shoulder, but never through a wall.
@@ -413,7 +457,10 @@ func _publish_aim() -> void:
 	var prompt := ""
 	if _holding:
 		kind = AimKind.HOLDING
-		prompt = "[RMB] Throw   -   release to drop"
+		if is_instance_valid(_held_demon) and is_instance_valid(_held):
+			prompt = "DRAGGING DEMON (%s)   -   [RMB] Shove   -   release to drop" % str(_held.get_meta(&"demon_label", "LIMB"))
+		else:
+			prompt = "[RMB] Throw   -   release to drop"
 	elif _aim_interactable:
 		kind = AimKind.INTERACTABLE
 		var action := "Use"
@@ -422,7 +469,12 @@ func _publish_aim() -> void:
 		prompt = "[F] %s" % action
 	elif _aim_body:
 		kind = AimKind.GRABBABLE
-		prompt = "[LMB / E] Grab %s" % str(_aim_body.get_meta(&"display_name", _aim_body.name))
+		var demon := _demon_of(_aim_body)
+		if demon:
+			# Awake it can only be grabbed at (and it hits back); stunned it can be dragged.
+			prompt = "[LMB / E] %s DEMON (%s)" % ["DRAG" if demon.get(&"is_stunned") else "GRAB", str(_aim_body.get_meta(&"demon_label", "LIMB"))]
+		else:
+			prompt = "[LMB / E] Grab %s" % str(_aim_body.get_meta(&"display_name", _aim_body.name))
 	if kind != _aim_kind or prompt != _aim_prompt:
 		_aim_kind = kind
 		_aim_prompt = prompt
@@ -430,12 +482,12 @@ func _publish_aim() -> void:
 
 
 func _try_interact() -> void:
-	if is_instance_valid(_aim_interactable):
+	if _knock_left <= 0.0 and is_instance_valid(_aim_interactable):
 		_aim_interactable.call(&"interact", self)
 
 
 func _update_grab(delta: float) -> void:
-	var wants := Input.is_action_pressed(&"grab")
+	var wants := Input.is_action_pressed(&"grab") and _knock_left <= 0.0
 	if not wants:
 		_grab_locked = false
 	if _holding and not is_instance_valid(_held):
@@ -462,6 +514,16 @@ func _begin_grab(body: RigidBody3D, world_point: Vector3) -> void:
 	body.sleeping = false
 	# A carried prop must not shove (or launch) the person carrying it.
 	body.add_collision_exception_with(self)
+	_held_demon = _demon_of(body)
+	if _held_demon:
+		# The whole ragdoll passes through its handler, or the trailing limbs would trip them up.
+		for part: RigidBody3D in _held_demon.call(&"get_bodies"):
+			part.add_collision_exception_with(self)
+		for i in range(_released.size() - 1, -1, -1):
+			var loose: Variant = _released[i]["body"]
+			if is_instance_valid(loose) and _demon_of(loose as RigidBody3D) == _held_demon:
+				_released.remove_at(i)
+		_held_demon.call(&"notify_grab", body, self)
 	for entry in _released:
 		if entry["body"] == body:
 			_released.erase(entry)
@@ -486,20 +548,29 @@ func _drive_held(_delta: float) -> void:
 	if state:
 		point_velocity = state.get_velocity_at_local_position(lever)
 	var desired := (error * pull_stiffness).limit_length(max_pull_speed) + get_real_velocity() * 0.6
-	var force := ((desired - point_velocity) * pull_response * _held.mass).limit_length(max_pull_force)
+	var force := ((desired - point_velocity) * pull_response * _pull_mass).limit_length(_pull_cap)
 	_held.apply_force(force, lever)
+	if is_instance_valid(_held_demon):
+		_held_demon.call(&"report_strain", _held_strain)
 
 
 func _release_held() -> void:
 	if not _holding:
 		return
 	var body := _held
+	var demon := _held_demon
 	_held = null
+	_held_demon = null
 	_holding = false
 	if is_instance_valid(body):
 		body.angular_damp = _held_angular_damp
 		# Keep ignoring it for a beat so it clears the capsule before colliding again.
 		_released.append({"body": body, "time": 0.35})
+	if is_instance_valid(demon):
+		for part: RigidBody3D in demon.call(&"get_bodies"):
+			if part != body:
+				_released.append({"body": part, "time": 0.35})
+		demon.call(&"notify_release", self)
 	held_changed.emit(null)
 
 
@@ -523,6 +594,122 @@ func _expire_released(delta: float) -> void:
 		elif float(entry["time"]) <= 0.0:
 			(body as RigidBody3D).remove_collision_exception_with(self)
 			_released.remove_at(i)
+
+
+## Weight and pull limits of whatever is in hand; a demon limb supplies its own.
+func _refresh_grab_tuning() -> void:
+	if not (_holding and is_instance_valid(_held)):
+		_carry_mass = 0.0
+		return
+	_pull_mass = _held.mass
+	_pull_cap = max_pull_force
+	_carry_mass = _held.mass
+	if is_instance_valid(_held_demon):
+		var tuning: Dictionary = _held_demon.call(&"get_grab_tuning", _held)
+		_pull_mass = float(tuning["mass"])
+		_pull_cap = float(tuning["force"])
+		_carry_mass = float(tuning["carry"])
+
+
+func _demon_of(body: RigidBody3D) -> Node:
+	if body and body.has_meta(&"demon"):
+		return body.get_meta(&"demon") as Node
+	return null
+
+
+# --- Knockdown ----------------------------------------------------------------
+
+## Floors the player and sends them sliding along `impulse` (a velocity, m/s).
+## Returns false while already down or still immune from the last one.
+func knock_down(impulse: Vector3, _source: Node = null) -> bool:
+	if _knock_left > 0.0 or _immune_left > 0.0:
+		return false
+	_knock_left = randf_range(knock_time_min, knock_time_max)
+	# Roll away from the blow.
+	_knock_roll = -1.0 if impulse.dot(global_transform.basis.x) > 0.0 else 1.0
+	_release_held()
+	_grab_locked = true
+	_sprinting = false
+	velocity = Vector3(impulse.x, maxf(impulse.y, 1.5), impulse.z)
+	add_trauma(0.75)
+	_model.set_knockdown(true)
+	knocked_down.emit(_knock_left)
+	return true
+
+
+func is_knocked_down() -> bool:
+	return _knock_left > 0.0
+
+
+func is_knockdown_immune() -> bool:
+	return _immune_left > 0.0
+
+
+## Camera shake, 0..1. Decays by itself.
+func add_trauma(amount: float) -> void:
+	_trauma = clampf(_trauma + amount, 0.0, 1.0)
+
+
+func _update_knockdown(delta: float) -> void:
+	if _knock_left > 0.0:
+		_knock_left -= delta
+		if _knock_left <= 0.0:
+			_knock_left = 0.0
+			_immune_left = knock_immunity
+			_model.set_knockdown(false)
+			recovered.emit()
+	elif _immune_left > 0.0:
+		_immune_left = maxf(0.0, _immune_left - delta)
+
+
+## A prop flying into the player fast enough knocks them over, whoever threw it.
+func _check_prop_impacts() -> void:
+	if _knock_left > 0.0 or _immune_left > 0.0:
+		return
+	var center := global_position + Vector3.UP * (_capsule.height * 0.5)
+	for node in _hit_sensor.get_overlapping_bodies():
+		var body := node as RigidBody3D
+		if body == null or body.freeze or body == _held or body.mass < 0.5 or _is_released(body):
+			continue
+		var speed := body.linear_velocity.length()
+		if speed <= knock_impact_speed:
+			continue
+		var heading := body.linear_velocity / speed
+		var gap := center - GameState.mass_center(body)
+		var closing := gap.dot(heading)
+		# It has to be coming at the body, on a line that actually connects: anywhere
+		# from shins to just over the head, not only dead centre.
+		var miss := gap - heading * closing
+		if closing <= 0.0 or speed * closing / maxf(gap.length(), 0.001) <= knock_impact_speed:
+			continue
+		if Vector2(miss.x, miss.z).length() > 0.7 or absf(miss.y) > _capsule.height * 0.5 + 0.25:
+			continue
+		knock_down(heading * clampf(body.mass * speed * 0.09, 3.5, 8.0) + Vector3.UP * 2.0, body)
+		return
+
+
+func _is_released(body: RigidBody3D) -> bool:
+	for entry in _released:
+		if entry["body"] == body:
+			return true
+	return false
+
+
+## Wider than the body, so a fast prop is seen a tick or two before it lands.
+func _build_hit_sensor() -> void:
+	var shape := CapsuleShape3D.new()
+	shape.radius = 0.9
+	shape.height = 2.4
+	var collider := CollisionShape3D.new()
+	collider.shape = shape
+	collider.position.y = 0.9
+	_hit_sensor = Area3D.new()
+	_hit_sensor.name = "HitSensor"
+	_hit_sensor.collision_layer = 0
+	_hit_sensor.collision_mask = GameState.LAYER_PROP
+	_hit_sensor.monitorable = false
+	_hit_sensor.add_child(collider)
+	add_child(_hit_sensor)
 
 
 # --- Grab tether --------------------------------------------------------------

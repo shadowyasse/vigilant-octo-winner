@@ -1,15 +1,17 @@
 extends Node3D
 ## Entry point. Builds the night atmosphere (environment, fog, moon), asks the
-## LevelBuilder for the site, then drops in the player and the HUD.
+## LevelBuilder for the site, then drops in the player, the HUD and the demon.
 ## Main.tscn contains only this script: everything else is constructed on run.
 
 const LevelBuilder := preload("res://scripts/LevelBuilder.gd")
 const PlayerScene := preload("res://scenes/Player.tscn")
 const ExorcistModel := preload("res://scripts/ExorcistModel.gd")
 const HudScene := preload("res://scenes/HUD.tscn")
+const DemonScene := preload("res://scenes/Demon.tscn")
 
 const FOG_COLOR := Color(0.16, 0.20, 0.27)
 const KILL_PLANE_Y := -25.0
+const DEBUG_KEYS := "Stage 2 test keys:  K stun / wake demon   J cycle AI (lurking > enraged > poltergeist throw)   L cycle bind level 0-3   F1 show on HUD"
 
 ## 0 orange, 1 teal, 2 olive, 3 purple.
 @export var suit_variant := 0
@@ -17,6 +19,7 @@ const KILL_PLANE_Y := -25.0
 var level: LevelBuilder
 var player: CharacterBody3D
 var hud: CanvasLayer
+var demon: Node3D
 
 
 func _ready() -> void:
@@ -35,9 +38,32 @@ func _ready() -> void:
 	hud = HudScene.instantiate() as CanvasLayer
 	add_child(hud)
 	hud.call(&"bind_player", player)
+
+	demon = DemonScene.instantiate() as Node3D
+	demon.transform = level.demon_spawn
+	add_child(demon)
+	demon.get_node("AI").call(&"setup", level, player)
+	hud.call(&"bind_demon", demon)
+	print(DEBUG_KEYS)
+
 	_spawn_squad()
 	_build_interior_air()
 	_tune_lights(self)
+
+
+## Stage 2 test keys. They act on the demon's brain, exactly as gameplay would.
+func _unhandled_input(event: InputEvent) -> void:
+	var key := event as InputEventKey
+	if key == null or not key.pressed or key.echo:
+		return
+	var brain := demon.get_node("AI")
+	match key.physical_keycode:
+		KEY_K:
+			brain.call(&"debug_toggle_stun")
+		KEY_J:
+			brain.call(&"debug_cycle_state")
+		KEY_L:
+			brain.call(&"debug_cycle_bind")
 
 
 func _physics_process(_delta: float) -> void:

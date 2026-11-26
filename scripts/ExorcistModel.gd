@@ -31,6 +31,7 @@ const CLIP_RUN := CLIP_PREFIX + "Run"
 const CLIP_RUN_BACK := CLIP_PREFIX + "Run_Back"
 const CLIP_WAVE := CLIP_PREFIX + "Wave"
 const CLIP_INTERACT := CLIP_PREFIX + "Interact"
+const CLIP_FALL := CLIP_PREFIX + "Death"
 const CROUCH_DROP := 0.5
 ## The rig's arms are short; first-person hands borrow some length to sit in frame.
 const FIRST_PERSON_ARM_STRETCH := 0.35
@@ -80,6 +81,7 @@ var _last_view_basis := Basis.IDENTITY
 var _stride_phase := 0.0
 var _hand_world: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
 var _showcase_wait := 0.0
+var _knocked := false
 
 
 func _ready() -> void:
@@ -151,6 +153,21 @@ func get_hand_position(side: int = 1) -> Vector3:
 	return _hand_world[side]
 
 
+## Tumble onto the floor (true) or get back up (false).
+func set_knockdown(active: bool) -> void:
+	if _knocked == active:
+		return
+	_knocked = active
+	if _anim == null:
+		return
+	if active and _anim.has_animation(CLIP_FALL):
+		_anim.speed_scale = 1.5
+		_anim.play(CLIP_FALL, 0.1)
+	elif not active:
+		_anim.speed_scale = 1.0
+		_anim.play(CLIP_IDLE, 0.45)
+
+
 func set_headlamp(on: bool) -> void:
 	_lamp_material.albedo_color = Color(1.0, 0.96, 0.85) if on else Color(0.2, 0.2, 0.19)
 	_lamp_material.emission_enabled = true
@@ -171,7 +188,7 @@ func _process(delta: float) -> void:
 		pose_updated.emit()
 	_air = move_toward(_air, 0.0 if _on_floor else 1.0, delta * 6.0)
 	_reach_weight = move_toward(_reach_weight, 1.0 if _reaching else 0.0, delta * 7.0)
-	_arms_weight = move_toward(_arms_weight, 1.0 if _first_person else 0.0, delta * 5.0)
+	_arms_weight = move_toward(_arms_weight, 1.0 if _first_person and not _knocked else 0.0, delta * 5.0)
 	var lean_target := 0.0 if _first_person else (0.16 if _sprinting else 0.0) + 0.3 * _crouch
 	_lean = lerpf(_lean, lean_target, minf(1.0, delta * 9.0))
 	if _speed > 0.3 and _on_floor:
@@ -189,7 +206,7 @@ func _process(delta: float) -> void:
 
 
 func _update_clip(delta: float) -> void:
-	if _anim == null:
+	if _anim == null or _knocked:
 		return
 	if showcase:
 		_showcase_wait -= delta
@@ -215,6 +232,12 @@ func _update_clip(delta: float) -> void:
 
 ## Runs after the animation clip has been applied, inside the skeleton update.
 func _apply_pose(skeleton: Skeleton3D) -> void:
+	if _knocked:
+		# The fall clip owns the whole body.
+		for i in 2:
+			_hand_world[i] = skeleton.global_transform * skeleton.get_bone_global_pose(_bone("Wrist.%s" % SIDES[i])).origin
+		pose_updated.emit()
+		return
 	var to_skeleton := skeleton.global_transform.affine_inverse()
 	var up := (to_skeleton.basis * Vector3.UP)
 	var unit := up.length()  # skeleton units per metre
