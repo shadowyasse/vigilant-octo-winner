@@ -32,9 +32,16 @@ uniform float pulse : hint_range(0.0, 1.0) = 0.0;
 uniform mat4 chest_from_model;
 uniform vec3 chest_center = vec3(0.0);
 uniform float chest_radius = 0.45;
-// Electric rim while the taser has hold of it.
-uniform vec3 shock_color : source_color = vec3(0.3, 0.92, 1.0);
+// While the taser has hold of it: a thin, hard electric-cyan Fresnel edge and veins that
+// crackle on and off in patches. Nothing is added to the face of the hide, so its dark
+// texture, horns and features stay readable under the current.
+uniform vec3 shock_color : source_color = vec3(0.1, 0.82, 1.0);
 uniform float shock = 0.0;
+uniform float shock_time = 0.0;
+uniform float shock_rim_energy = 2.6;
+uniform float shock_vein_energy = 1.7;
+// Shadow lunge: the hide drinks the light for a moment.
+uniform float shade : hint_range(0.0, 1.0) = 0.0;
 
 varying vec3 chest_position;
 
@@ -55,7 +62,7 @@ void fragment() {
 	vec3 base = mix(soot_color, ash_color, smoothstep(0.05, 0.85, value));
 	base = mix(base, base * (paint / max(value, 0.05)), paint_keep);
 	base *= mix(0.55, 1.35, grain);
-	ALBEDO = base * (1.0 - 0.6 * painted);
+	ALBEDO = base * (1.0 - 0.6 * painted) * (1.0 - 0.85 * shade);
 
 	NORMAL_MAP = texture(detail_normal, detail_uv).rgb;
 	NORMAL_MAP_DEPTH = normal_strength;
@@ -75,5 +82,12 @@ void fragment() {
 	glow += ember_color * painted * paint_energy * (0.7 + 0.3 * pulse);
 	float grazing = 1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0);
 	float fresnel = pow(grazing, rim_power);
-	EMISSION = glow + rim_color * fresnel * rim_energy + shock_color * (pow(grazing, 1.5) * 5.0 + 0.2) * shock;
+	// Crisp band at the silhouette only: zero across the faces turned toward the camera.
+	float shock_edge = smoothstep(0.66, 0.9, grazing);
+	// Veins flicker in cells that re-roll two dozen times a second.
+	vec2 cell = floor(UV * vein_scale * 5.0);
+	float roll = fract(sin(dot(cell + floor(shock_time * 24.0), vec2(12.9898, 78.233))) * 43758.5453);
+	float crackle = step(0.5, roll) * smoothstep(0.3, 0.7, max(veins.r, max(veins.g, veins.b)));
+	vec3 current = shock_color * shock * (shock_edge * shock_rim_energy + crackle * shock_vein_energy);
+	EMISSION = (glow + rim_color * fresnel * rim_energy) * (1.0 - shade) + current;
 }

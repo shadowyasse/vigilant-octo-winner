@@ -5,7 +5,8 @@ extends SceneTree
 ## Belt: slot keys, mouse wheel, E hand-grab lowering the tool, HUD slots, hints, bank.
 ## Holy Lasso: 11 m range, forgiving 0.22 m cast, collar, spring tension, reeling,
 ##             anchoring, R release, tug of war with a conscious demon, the anchor snapping.
-## Holy Taser: props, 48 stun/s, convulsions and shock rim, battery, overheat lockout.
+## Holy Taser: props, 30 stun/s, convulsions and shock rim, battery, overheat lockout.
+##             (Stage 4's taser evasion is switched off here; tools/stage4_test.gd covers it.)
 ## Duct Tape:  1.8 s wraps, interruption, +20 stun, bands on BoneAttachment3D per level,
 ##             struggle scaling, hauling the bound demon on the rope, the open-doors hint.
 ## The seal / payout / next-contract half of the loop lives in tools/smoke_test.gd.
@@ -21,7 +22,7 @@ const TORSO := 1
 const ARENA := Vector3(-13.0, 0.1, 9.0)
 const EAST := Vector3.RIGHT
 const SOUTH := Vector3.BACK
-const MAIN_CHILDREN: Array[String] = ["WorldEnvironment", "Moonlight", "Moon", "Level", "Player", "HUD", "Demon", "Crew1", "Crew2", "Crew3", "InteriorAir", "Contracts"]
+const MAIN_CHILDREN: Array[String] = ["WorldEnvironment", "Moonlight", "Moon", "Level", "Player", "HUD", "Demon", "InteriorAir", "Contracts", "Possession", "Net", "PauseMenu"]
 
 var _main: Node
 var _state: Node
@@ -581,6 +582,9 @@ func _step_lasso_demon() -> void:
 		_put_crate(ARENA + Vector3(-2.5, 0.16, 3.0))
 		_stand(ARENA, ARENA + EAST * 4.0 + Vector3.UP * 1.4)
 		_brain.set("passive", false)
+		# This file checks the gadgets themselves, so the demon stands and takes it.
+		_brain.set("evade_threshold", 100000.0)
+		_brain.set("_evade_next", 100000.0)
 		_immune = true
 		_tap(KEY_P)
 		return
@@ -678,7 +682,7 @@ func _step_taser_demon() -> void:
 			_stun_tick = _tick
 			_hold(&"move_forward", false)
 			var took := (_stun_tick - _fire_tick) / 60.0
-			_check("about two seconds of current drops a fresh demon", took > 1.9 and took < 2.8, "%.2f s" % took)
+			_check("about three and a half seconds of current drops a fresh demon", took > 3.2 and took < 4.0, "%.2f s" % took)
 			_check("it goes limp: STUNNED", int(_brain.get("state")) == STUNNED and _state.call("is_step_done", &"subdue_demon"), str(_brain.call("get_state_name")))
 			_check("jagged arcs, sparks and a flickering light reach it", _saw_bolts and _saw_sparks and _saw_light)
 			_check("its limbs convulse under the current", _peak_spin > 6.0, "%.1f rad/s" % _peak_spin)
@@ -687,13 +691,13 @@ func _step_taser_demon() -> void:
 			_check("HUD moves on to binding it", str(_hud.get("_task").text) == "> Bind with Duct Tape [3] & haul to the van", str(_hud.get("_task").text))
 		elif _tick - _fire_tick > 400:
 			_stun_tick = _tick
-			_check("about two seconds of current drops a fresh demon", false, "stun %.0f after %.1f s" % [float(_demon.get("stun_meter")), (_tick - _fire_tick) / 60.0])
+			_check("about three and a half seconds of current drops a fresh demon", false, "stun %.0f after %.1f s" % [float(_demon.get("stun_meter")), (_tick - _fire_tick) / 60.0])
 		return
 	if _overheat_tick == 0:
 		if int(_taser.get("overheats")) >= 1:
 			_overheat_tick = _tick
 			var took := (_overheat_tick - _fire_tick) / 60.0
-			_check("a full battery lasts just over three seconds", took > 3.0 and took < 3.3, "%.2f s" % took)
+			_check("a full battery lasts four seconds", took > 3.9 and took < 4.2, "%.2f s" % took)
 			_check("running flat overheats it: 2.8 s lockout", float(_taser.get("battery")) <= 0.0 and absf(float(_taser.get("overheat_left")) - 2.8) < 0.05
 					and (_taser.get("_steam") as GPUParticles3D).emitting, "%.2f s" % float(_taser.get("overheat_left")))
 			_check("hiss and warning beep", int(_cues().get(&"hiss", 0)) == 1 and int(_cues().get(&"beep", 0)) == 1, str(_cues()))

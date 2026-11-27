@@ -6,6 +6,10 @@ extends Node3D
 ## in hand, `simulate()` on every physics tick (ropes stay tied and batteries
 ## recharge in the holster), `animate()` on every frame it is shown.
 ## Models are authored in metres with -Z pointing away from the holder.
+##
+## In co-op the host works every player's gadgets. Everywhere else a gadget is a
+## puppet: `use()` and `simulate()` never run, and `read_net()` feeds it the few
+## numbers its drawing code needs (see `write_net()`).
 
 const Parts := preload("res://scripts/gadgets/GadgetParts.gd")
 
@@ -106,6 +110,26 @@ func get_progress() -> float:
 
 func get_progress_label() -> String:
 	return ""
+
+
+## Appends this gadget's drawable state for the wire (fixed sizes: NET_FLOATS, NET_INTS).
+func write_net(_floats: PackedFloat32Array, _ints: PackedInt32Array) -> void:
+	pass
+
+
+## The other end of `write_net`, on a machine where this gadget is a puppet.
+func read_net(_floats: PackedFloat32Array, _f: int, _ints: PackedInt32Array, _i: int) -> void:
+	pass
+
+
+## A message for whoever holds this gadget, on whichever machine they are.
+func notify(text: String) -> void:
+	GameState.post_notice_for(player, text)
+
+
+## True on a machine that only draws this gadget.
+func is_puppet() -> bool:
+	return not player.simulates
 
 
 ## The live demon, if there is one on site.

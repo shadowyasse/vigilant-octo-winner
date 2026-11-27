@@ -13,6 +13,11 @@ extends "res://scripts/gadgets/Gadget.gd"
 ## stunned one comes quietly. Holding LMB reels in, RMB hammers an anchor pin into
 ## a nearby surface and ties the rope off there, which frees the hands for the
 ## taser or the tape. An anchored demon thrashes and snaps the rope in 8-12 s.
+##
+## Crewmates can be roped too. The rope then works as a leash (see Player.set_leash):
+## reel a friend out from under a flying couch, drag a possessed one to the salt
+## circle, or pin one to a porch column with RMB. They get out by mashing Space, or
+## with R once two seconds have passed.
 
 enum Mode { IDLE, FLYING, ATTACHED, ANCHORED, RETURNING }
 
@@ -43,8 +48,11 @@ const ROPE_SIDES := 6
 const ROPE_RADIUS := 0.014
 ## Metres of rope per turn of its strands.
 const ROPE_LAY := 0.06
-const TARGET_MASK := 4 | 16
-const SOLID_MASK := 1 | 4 | 8 | 16
+const TARGET_MASK := 2 | 4 | 16
+const SOLID_MASK := 1 | 2 | 4 | 8 | 16
+## Wire size: local point, rope end or anchor, pin normal, tension, rest length / mode, target, flags.
+const NET_FLOATS := 11
+const NET_INTS := 3
 
 var mode: Mode = Mode.IDLE
 ## 0..1: how hard the rope is pulling.
@@ -55,8 +63,12 @@ var snaps := 0
 
 var _target: RigidBody3D
 var _target_demon: Node3D
+## A roped crewmate (then `_target` is null).
+var _target_player: Node3D
 var _local := Vector3.ZERO
-var _pending: RigidBody3D
+var _pending: Node3D
+## Puppets only: the wire id of what the rope was last seen tied to.
+var _net_ref := 0
 var _tip := Vector3.ZERO
 var _fly_from := Vector3.ZERO
 var _fly_to := Vector3.ZERO
@@ -179,7 +191,7 @@ func get_hint() -> String:
 			return "[LMB] Hold: reel in  /  tap: let go   [RMB] Anchor to wall   [R] Detach   [E] Hand grab"
 		Mode.ANCHORED:
 			return "[R] Release rope   [2] Taser   [3] Duct tape   [E] Hand grab"
-	return "[LMB] Shoot lasso   [RMB] Anchor to wall   [R] Detach   [E] Hand grab"
+	return "[LMB] Shoot lasso (demon, props, crewmates)   [RMB] Anchor to wall   [R] Detach   [E] Hand grab"
 
 
 func get_badge() -> String:
@@ -204,6 +216,29 @@ func get_target() -> RigidBody3D:
 	return _target if is_tethered() and is_instance_valid(_target) else null
 
 
+## The crewmate on the end of the rope, if that is what it caught.
+func get_target_player() -> Node3D:
+	return _target_player if is_tethered() and is_instance_valid(_target_player) else null
+
+
+## True while this rope has hold of `demon`, pinned or in hand.
+func is_roping(demon: Node) -> bool:
+	return is_tethered() and demon != null and _target_demon == demon
+
+
+## The demon has ripped itself off this rope.
+func release_demon(demon: Node) -> void:
+	if is_roping(demon):
+		_snap()
+
+
+## `who` has fought their way out of this rope.
+func release_player(who: Node) -> void:
+	if who != null and get_target_player() == who:
+		notify("%s slipped your rope" % str(who.get(&"display_name")))
+		_detach("")
+
+
 ## R: let go of whatever the rope holds, from any slot.
 func request_release() -> void:
 	_release_asked = true
@@ -214,6 +249,14 @@ func reset() -> void:
 	_release()
 	mode = Mode.IDLE
 	_rope.visible = false
+
+
+func _exit_tree() -> void:
+	# The collar rides the thing it caught, not this node: take it along.
+	if is_instance_valid(_collar):
+		_collar.queue_free()
+	if _target_demon and is_instance_valid(_target_demon):
+		_target_demon.call(&"notify_rope", self, false, false)
 
 
 # --- Input -------------------------------------------------------------------------
@@ -240,7 +283,7 @@ func use(delta: float, input: Dictionary) -> void:
 				_try_anchor()
 		Mode.ANCHORED:
 			if input["fire_pressed"]:
-				GameState.post_notice("Rope is anchored  -  [R] to release it")
+				notify("Rope is anchored  -  [R] to release it")
 
 
 func simulate(delta: float) -> void:
@@ -270,6 +313,9 @@ func _fire() -> void:
 	_pending = found["body"]
 	_fly_to = found["point"]
 	_local = _pending.global_transform.affine_inverse() * _fly_to if _pending else Vector3.ZERO
+	if _pending and _pending.is_in_group(GameState.GROUP_PLAYER):
+		# Round the waist, wherever on the body the throw landed.
+		_local = Vector3(0.0, 1.05, 0.0)
 	_fly_from = _muzzle.global_position
 	_tip = _fly_from
 	_fly_time = clampf(_fly_from.distance_to(_fly_to) / FLY_SPEED, 0.06, 0.22)
@@ -315,6 +361,8 @@ func _find_target() -> Dictionary:
 
 
 func _latchable(body: Object) -> bool:
+	if body is Node and (body as Node).is_in_group(GameState.GROUP_PLAYER):
+		return body != player
 	var rigid := body as RigidBody3D
 	return rigid != null and not rigid.freeze and (rigid.has_meta(&"demon") or rigid.is_in_group(GameState.GROUP_GRABBABLE))
 
@@ -336,8 +384,11 @@ func _fly(delta: float) -> void:
 	_pending = null
 
 
-func _latch(body: RigidBody3D) -> void:
-	_target = body
+func _latch(body: Node3D) -> void:
+	if body.is_in_group(GameState.GROUP_PLAYER):
+		_latch_player(body)
+		return
+	_target = body as RigidBody3D
 	_target_demon = demon_of(body)
 	var attach := body.global_transform * _local
 	rest_length = clampf(_hold_point().distance_to(attach), MIN_LENGTH, RANGE)
@@ -349,16 +400,48 @@ func _latch(body: RigidBody3D) -> void:
 	audio.call(&"play", &"clink", attach, -4.0, 1.5)
 	var label := str(body.get_meta(&"demon_label", body.get_meta(&"display_name", body.name)))
 	if _target_demon:
+		_target_demon.call(&"notify_rope", self, true, false)
 		_target_demon.call(&"provoke", player)
-		GameState.post_notice("LASSO ON THE DEMON (%s)" % label)
+		notify("LASSO ON THE DEMON (%s)" % label)
 	else:
-		GameState.post_notice("LASSO ON %s" % label.to_upper())
+		notify("LASSO ON %s" % label.to_upper())
+
+
+## A crewmate on the end of the rope: reel them in, walk them about, or pin them with RMB.
+func _latch_player(body: Node3D) -> void:
+	_target = null
+	_target_demon = null
+	_target_player = body
+	var attach := _attach_point()
+	rest_length = clampf(_hold_point().distance_to(attach), MIN_LENGTH, RANGE)
+	tension = 0.0
+	mode = Mode.ATTACHED
+	_make_collar()
+	_hit_sparks.global_position = attach
+	_hit_sparks.restart()
+	audio.call(&"play", &"clink", attach, -4.0, 1.5)
+	var friend := str(body.get(&"display_name"))
+	notify("LASSO ON %s  -  [LMB] reel in   [RMB] pin to a wall or post" % friend)
+	GameState.post_notice_for(body, "%s HAS A ROPE ON YOU  -  mash [SPACE], or [R] after 2 s" % str(player.display_name))
+
+
+## Where the rope bites, in world space.
+func _attach_point() -> Vector3:
+	if is_instance_valid(_target_player):
+		return _target_player.global_transform * _local
+	if is_instance_valid(_target):
+		return _target.global_transform * _local
+	return _tip
 
 
 ## The golden noose cinched round whatever was caught. It rides the body.
 func _make_collar() -> void:
 	var radius := clampf(Vector2(_local.x, _local.z).length() + 0.04, 0.1, 0.42)
 	var at := Vector3(0.0, _local.y, 0.0)
+	var wearer: Node3D = _target
+	if is_instance_valid(_target_player):
+		wearer = _target_player
+		radius = 0.3
 	if _target_demon:
 		var part := int(_target.get_meta(&"demon_part", 0))
 		var layout: Dictionary = _target_demon.call(&"get_layout")
@@ -388,7 +471,7 @@ func _make_collar() -> void:
 	halo.omni_range = 2.4
 	halo.shadow_enabled = false
 	_collar.add_child(halo)
-	_target.add_child(_collar)
+	wearer.add_child(_collar)
 
 
 # --- Tension -----------------------------------------------------------------------
@@ -401,10 +484,13 @@ func _hold_point() -> Vector3:
 
 
 func _pull(delta: float) -> void:
+	if _target_player:
+		_pull_player(delta)
+		return
 	if not is_instance_valid(_target) or _target.is_queued_for_deletion() or _target.freeze:
 		_detach("")
 		return
-	if mode == Mode.ATTACHED and (int(manager.get(&"slot")) != 1 or player.is_knocked_down()):
+	if mode == Mode.ATTACHED and (int(manager.get(&"slot")) != 1 or not player.can_act()):
 		_detach("Lasso dropped")
 		return
 	var hold := _hold_point()
@@ -464,12 +550,52 @@ func _pull(delta: float) -> void:
 				if float(player.get(&"stamina")) <= 0.0:
 					_detach("The demon tore the lasso out of your hands!")
 					return
+			elif _target_demon and int(_target_demon.call(&"get_hauler_count")) >= 2:
+				# More than one of the crew on it: the load is shared and the rope stays quiet.
+				tension *= 0.85
 			elif _target_demon == null:
 				player.apply_drag(direction * clampf(_target.mass / 60.0, 0.0, 1.0) * 1.2 * tension)
 	if mode == Mode.ANCHORED:
 		_strain(delta, awake, hold, attach)
 	else:
 		audio.call(&"set_loop", &"creak", tension > 0.55, hold, -8.0, 0.9 + tension * 0.3)
+
+
+## A crewmate on the rope. They are leashed to the holder's chest (or the pin): free to
+## move inside the rope's length, hauled back in beyond it. Their weight tugs at the
+## holder too, so two friends on one rope really are tied together.
+func _pull_player(delta: float) -> void:
+	if not is_instance_valid(_target_player) or _target_player.is_queued_for_deletion():
+		_detach("")
+		return
+	if mode == Mode.ATTACHED and (int(manager.get(&"slot")) != 1 or not player.can_act()):
+		_detach("Lasso dropped")
+		return
+	var hold := _hold_point()
+	var attach := _attach_point()
+	var span := attach - hold
+	var distance := span.length()
+	if not is_finite(distance):
+		return
+	var stretch := distance - rest_length
+	tension = lerpf(tension, clampf(stretch, 0.0, 1.0), minf(1.0, delta * 10.0))
+	if stretch > SNAP_STRETCH:
+		_snap()
+		return
+	_target_player.call(&"set_leash", hold, rest_length, int(player.seat), mode == Mode.ANCHORED)
+	if mode == Mode.ATTACHED:
+		if stretch > 0.0 and distance > 0.05:
+			player.apply_drag(span / distance * minf(stretch * 2.2, 2.2))
+		audio.call(&"set_loop", &"creak", tension > 0.55, hold, -8.0, 0.9 + tension * 0.3)
+		return
+	# Pinned: the rope frays twice as slowly as it does under a demon, but it does fray.
+	_anchor_life -= delta * 0.5
+	var failing := _anchor_life < 2.5
+	_strain_sparks.global_position = hold
+	_strain_sparks.emitting = failing
+	audio.call(&"set_loop", &"creak", failing or tension > 0.55, hold, -6.0, 1.1)
+	if _anchor_life <= 0.0:
+		_snap()
 
 
 ## An anchored rope wears out: fast under a conscious demon, hardly at all under a limp one.
@@ -497,7 +623,7 @@ func _try_anchor() -> void:
 	var query := PhysicsRayQueryParameters3D.create(from, from + aim * ANCHOR_RANGE, GameState.LAYER_WORLD, [player.get_rid()])
 	var hit := (player as Node3D).get_world_3d().direct_space_state.intersect_ray(query)
 	if hit.is_empty() or not (hit["collider"] is StaticBody3D):
-		GameState.post_notice("Aim at a wall, post or floor within 3.5 m to anchor")
+		notify("Aim at a wall, post or floor within 3.5 m to anchor")
 		audio.call(&"play", &"dry", from)
 		return
 	var surface: Vector3 = hit["position"]
@@ -506,16 +632,22 @@ func _try_anchor() -> void:
 	_pin.visible = true
 	_anchor = surface + normal * 0.15
 	mode = Mode.ANCHORED
-	var attach := _target.global_transform * _local
+	var attach := _attach_point()
 	rest_length = clampf(_anchor.distance_to(attach) * 0.95, MIN_LENGTH * 0.6, RANGE)
 	_anchor_life = randf_range(8.0, 12.0)
+	if _target_demon:
+		_target_demon.call(&"notify_rope", self, true, true)
 	_thrash_left = 0.4
 	kick = 0.7
 	player.shake(0.2)
 	_hit_sparks.global_position = surface
 	_hit_sparks.restart()
 	audio.call(&"play", &"clink", surface, 2.0)
-	GameState.post_notice("ROPE ANCHORED  -  hands free" if _target_demon else "ROPE ANCHORED")
+	if is_instance_valid(_target_player):
+		notify("%s IS PINNED  -  [R] lets them go" % str(_target_player.get(&"display_name")))
+		GameState.post_notice_for(_target_player, "PINNED BY %s  -  mash [SPACE], or [R] after 2 s" % str(player.display_name))
+	else:
+		notify("ROPE ANCHORED  -  hands free" if _target_demon else "ROPE ANCHORED")
 
 
 func _snap() -> void:
@@ -530,9 +662,9 @@ func _snap() -> void:
 ## Lets go and whips the rope back to the hand.
 func _detach(message: String) -> void:
 	if not message.is_empty():
-		GameState.post_notice(message)
-	if is_tethered() and is_instance_valid(_target):
-		_tip = _target.global_transform * _local
+		notify(message)
+	if is_tethered():
+		_tip = _attach_point()
 	mode = Mode.RETURNING
 	_fly_left = RETURN_TIME
 	_release()
@@ -541,9 +673,12 @@ func _detach(message: String) -> void:
 func _release() -> void:
 	if is_instance_valid(_collar):
 		_collar.queue_free()
+	if _target_demon and is_instance_valid(_target_demon):
+		_target_demon.call(&"notify_rope", self, false, false)
 	_collar = null
 	_target = null
 	_target_demon = null
+	_target_player = null
 	_pending = null
 	_pin.visible = false
 	_strain_sparks.emitting = false
@@ -554,7 +689,10 @@ func _release() -> void:
 
 # --- Drawing -----------------------------------------------------------------------
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
+	if is_puppet():
+		_time += delta
+		audio.call(&"set_loop", &"creak", is_tethered() and tension > 0.55, _hold_point(), -8.0, 0.9 + tension * 0.3)
 	var out := mode != Mode.IDLE
 	_rope.visible = out
 	_noose.visible = not out
@@ -568,8 +706,8 @@ func _process(_delta: float) -> void:
 			start = _anchor
 		Mode.RETURNING:
 			end = _tip.lerp(start, clampf(1.0 - _fly_left / RETURN_TIME, 0.0, 1.0))
-	if is_tethered() and is_instance_valid(_target):
-		end = _target.global_transform * _local
+	if is_tethered() and (is_instance_valid(_target) or is_instance_valid(_target_player)):
+		end = _attach_point()
 		slack = maxf(0.0, rest_length - start.distance_to(end))
 	# Slack hangs under the chord; a loaded rope is a straight line.
 	var span := end - start
@@ -627,3 +765,67 @@ func _draw_rope(points: PackedVector3Array) -> void:
 				_rope_mesh.surface_set_uv(Vector2(lengths[corner.x] / ROPE_LAY, float(corner.z) / ROPE_SIDES))
 				_rope_mesh.surface_add_vertex(rings[corner.x][corner.y])
 	_rope_mesh.surface_end()
+
+
+# --- Replication -------------------------------------------------------------------------
+
+func write_net(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
+	# The far end of the rope while it is in the air, the pin while it is tied off.
+	var point := _tip
+	match mode:
+		Mode.ANCHORED:
+			point = _anchor
+		Mode.RETURNING:
+			point = _tip.lerp(_hold_point(), clampf(1.0 - _fly_left / RETURN_TIME, 0.0, 1.0))
+	var normal := _pin.global_transform.basis.y
+	floats.append_array(PackedFloat32Array([_local.x, _local.y, _local.z, point.x, point.y, point.z,
+			normal.x, normal.y, normal.z, tension, rest_length]))
+	var caught: Node3D = get_target_player() if _target_player else get_target()
+	var failing := mode == Mode.ANCHORED and _anchor_life < 2.5 and _strain_sparks.emitting
+	ints.append_array(PackedInt32Array([mode, GameState.body_ref(caught), 1 if failing else 0]))
+
+
+func read_net(floats: PackedFloat32Array, f: int, ints: PackedInt32Array, i: int) -> void:
+	var next := clampi(ints[i], 0, Mode.size() - 1) as Mode
+	var ref := ints[i + 1]
+	var point := Vector3(floats[f + 3], floats[f + 4], floats[f + 5])
+	var normal := Vector3(floats[f + 6], floats[f + 7], floats[f + 8])
+	_local = Vector3(floats[f], floats[f + 1], floats[f + 2])
+	tension = floats[f + 9]
+	rest_length = floats[f + 10]
+	var tied := next == Mode.ATTACHED or next == Mode.ANCHORED
+	if ref != _net_ref or tied != is_tethered():
+		# Caught something new, or let go: move the collar.
+		if is_instance_valid(_collar):
+			_collar.queue_free()
+		_collar = null
+		_target = null
+		_target_demon = null
+		_target_player = null
+		_net_ref = ref
+		var caught := GameState.ref_body(ref) if tied else null
+		if caught:
+			if caught.is_in_group(GameState.GROUP_PLAYER):
+				_target_player = caught
+			else:
+				_target = caught as RigidBody3D
+				_target_demon = demon_of(caught)
+			mode = next
+			_make_collar()
+			_hit_sparks.global_position = _attach_point()
+			_hit_sparks.restart()
+	mode = next
+	match mode:
+		Mode.FLYING, Mode.RETURNING:
+			_tip = point
+			_fly_left = RETURN_TIME
+		Mode.ANCHORED:
+			_anchor = point
+			if normal.is_finite() and normal.length_squared() > 0.25:
+				normal = normal.normalized()
+				_pin.global_transform = Transform3D(Basis(Quaternion(Vector3.UP, normal)), point - normal * 0.15)
+	_pin.visible = mode == Mode.ANCHORED
+	var failing := ints[i + 2] != 0
+	_anchor_life = 1.0 if failing else 10.0
+	_strain_sparks.global_position = _anchor
+	_strain_sparks.emitting = failing and mode == Mode.ANCHORED

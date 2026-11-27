@@ -49,6 +49,10 @@ const LIVERY := Color(0.86, 0.34, 0.07)
 ## Seconds the van rocks on its springs after the doors are sealed on a demon.
 const ROCK_TIME := 2.5
 const SEAL_COLOR := Color(1.0, 0.72, 0.26)
+## Emission of the seal at rest and the most the flash adds when it lands. Both sit near
+## the bloom threshold on purpose: the rune must read as hot metal, not as a white disc.
+const SEAL_GLOW := 1.15
+const SEAL_FLASH := 1.5
 
 var left_door: HingedDoor
 var right_door: HingedDoor
@@ -158,9 +162,9 @@ func _update_seal(delta: float) -> void:
 	if not _seal.visible:
 		return
 	_seal_flash = maxf(0.0, _seal_flash - delta * 1.3)
-	var glow := 0.5 + 0.18 * sin(_time * 2.4) + _seal_flash * 5.0
-	_seal_material.albedo_color = Color(SEAL_COLOR.r * glow, SEAL_COLOR.g * glow, SEAL_COLOR.b * glow)
-	_seal_light.light_energy = 0.35 + _seal_flash * 5.0
+	# Molten gold in the grooves: a slow breathing glow, a short flare when the seal lands.
+	_seal_material.emission_energy_multiplier = SEAL_GLOW + 0.2 * sin(_time * 2.4) + _seal_flash * SEAL_FLASH
+	_seal_light.light_energy = 0.22 + _seal_flash * 1.1
 	if _rock_left <= 0.0:
 		return
 	_rock_left -= delta
@@ -186,8 +190,21 @@ func _update_seal(delta: float) -> void:
 
 
 func _build_seal() -> void:
-	_seal_material = Parts.additive(Parts.sigil(512))
-	_seal_material.vertex_color_use_as_albedo = false
+	# Etched into the paint rather than projected onto it: an alpha-blended, lit decal whose
+	# grooves glow from inside, so the rusted doors still show between the lines.
+	var etching := _etched_sigil()
+	_seal_material = StandardMaterial3D.new()
+	_seal_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_seal_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	_seal_material.albedo_color = Color(0.34, 0.2, 0.06)
+	_seal_material.albedo_texture = etching
+	_seal_material.roughness = 0.45
+	_seal_material.metallic = 0.6
+	_seal_material.emission_enabled = true
+	_seal_material.emission = Color(1.0, 0.6, 0.14)
+	_seal_material.emission_texture = etching
+	_seal_material.emission_operator = BaseMaterial3D.EMISSION_OP_MULTIPLY
+	_seal_material.emission_energy_multiplier = SEAL_GLOW
 	var plate := QuadMesh.new()
 	plate.size = Vector2(1.95, 1.95)
 	_seal = MeshInstance3D.new()
@@ -202,7 +219,7 @@ func _build_seal() -> void:
 	_seal_light = OmniLight3D.new()
 	_seal_light.name = "SealGlow"
 	_seal_light.light_color = SEAL_COLOR
-	_seal_light.omni_range = 6.0
+	_seal_light.omni_range = 4.0
 	_seal_light.shadow_enabled = false
 	_seal_light.position = Vector3(0.0, 1.7, REAR_Z - 0.8)
 	_seal_light.visible = false
@@ -213,6 +230,32 @@ func _build_seal() -> void:
 		puff.position = corner
 		add_child(puff)
 		_dust.append(puff)
+
+
+## The containment sigil as gritty etched lines: its strokes become alpha, broken up by a
+## scratch noise so the rune looks cut into old paint. Built once and shared.
+static var _etching: ImageTexture
+
+func _etched_sigil() -> ImageTexture:
+	if _etching:
+		return _etching
+	var source := Parts.sigil(512).get_image()
+	source.clear_mipmaps()
+	var size := source.get_size()
+	var grit := FastNoiseLite.new()
+	grit.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	grit.frequency = 0.11
+	grit.seed = 4130
+	var image := Image.create(size.x, size.y, false, Image.FORMAT_RGBA8)
+	image.fill(Color(1.0, 1.0, 1.0, 0.0))
+	for y in size.y:
+		for x in size.x:
+			if source.get_pixel(x, y).r > 0.5:
+				var wear := clampf(0.72 + 0.6 * grit.get_noise_2d(x, y) + 0.25 * grit.get_noise_2d(x * 4.0, y * 4.0), 0.18, 1.0)
+				image.set_pixel(x, y, Color(wear, wear, wear, wear))
+	image.generate_mipmaps()
+	_etching = ImageTexture.create_from_image(image)
+	return _etching
 
 
 # --- Cab (from the truck model) -------------------------------------------------

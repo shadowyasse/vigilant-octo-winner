@@ -45,6 +45,7 @@ var _stunned := false
 var _captured := false
 var _flash := 0.0
 var _shock := 0.0
+var _shade := 0.0
 ## Tape bands by bind level (1..3); built hidden, shown as the demon is wrapped.
 var _tape: Array[Array] = [[], [], [], []]
 var _tape_mounts: Dictionary = {}
@@ -91,6 +92,11 @@ func flash() -> void:
 	_flash = 1.0
 
 
+## The hide drinks the light for a moment (the evasive shadow lunge) and sheds a cloud of ash.
+func shadow_step() -> void:
+	_shade = 1.0
+
+
 func get_rage() -> float:
 	return _rage
 
@@ -108,6 +114,7 @@ func _process(delta: float) -> void:
 	_cast = move_toward(_cast, 1.0 if _casting else 0.0, delta * 5.0)
 	_flash = maxf(0.0, _flash - delta * 1.6)
 	_shock = maxf(0.0, _shock - delta * 5.0)
+	_shade = maxf(0.0, _shade - delta * 2.2)
 	_settle_tape(delta)
 	_apply_mood()
 
@@ -134,7 +141,10 @@ func _apply_mood() -> void:
 	_skin.set_shader_parameter(&"limb_energy", limbs)
 	_skin.set_shader_parameter(&"paint_energy", paint)
 	_skin.set_shader_parameter(&"pulse", beat)
-	_skin.set_shader_parameter(&"shock", _shock * (0.7 + 0.3 * sin(_time * 71.0)))
+	# The taser draws a hard cyan rim and crackling veins; the hide itself stays dark and readable.
+	_skin.set_shader_parameter(&"shock", _shock * (0.75 + 0.25 * sin(_time * 71.0)))
+	_skin.set_shader_parameter(&"shock_time", _time)
+	_skin.set_shader_parameter(&"shade", _shade)
 	_skin.set_shader_parameter(&"rim_energy", 0.3 + 0.35 * _rage + 0.4 * _cast)
 	# The vein mask is anchored to the ribcage, so it has to follow the chest bone.
 	var chest := _skeleton.get_bone_global_pose(_chest_bone)
@@ -142,7 +152,7 @@ func _apply_mood() -> void:
 	_eye.emission_energy_multiplier = eyes
 	_eye_light.light_energy = eyes * 0.03
 	_chest_light.light_energy = (core + paint) * 0.07
-	_ash.amount_ratio = clampf(0.4 + 0.6 * _rage, 0.0, 1.0)
+	_ash.amount_ratio = clampf(0.4 + 0.6 * _rage + _shade, 0.0, 1.0)
 	_sparks.amount_ratio = clampf(0.04 + _rage * 0.96 + (0.45 if _stunned else 0.0) + _flash + _cast, 0.0, 1.0)
 
 
@@ -381,7 +391,7 @@ func _ramp(offsets: Array, colors: Array) -> GradientTexture1D:
 	return texture
 
 
-## The taser's electric rim light: `amount` 0..1. It fades by itself.
+## The taser's electric rim and vein crackle: `amount` 0..1. It fades by itself.
 func set_shock(amount: float) -> void:
 	_shock = maxf(_shock, clampf(amount, 0.0, 1.0))
 

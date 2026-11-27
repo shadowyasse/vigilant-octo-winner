@@ -9,6 +9,12 @@ extends Node
 ## POLTERGEIST_THROW    ...levitating nearby props and hurling them at the player
 ## STUNNED              limp ragdoll (the body handles it) until the stun meter drains
 ## CAPTURED             stunned with its torso inside the van's cargo cage
+## POSSESSING           out of the world, riding inside a player (see PossessionSystem)
+##
+## It hunts whoever is nearest and still on their feet: every exorcist on site is
+## a person, and it scales itself to how many of them there are. It no longer
+## stands in a taser's arc either: a third of a stun meter of current and it
+## sidesteps, blows the lamps or answers with a snap throw.
 ##
 ## Navigation is a waypoint graph of rooms and doorways from the LevelBuilder,
 ## with whisker rays for local steering; this script only writes intent into
@@ -19,8 +25,13 @@ signal state_changed(state: int)
 signal discovered
 ## The van's doors have shut on it.
 signal sealed
+## It dodged the current: 0 sidestep, 1 lamps blown, 2 snap throw.
+signal evaded(kind: int)
+## It came round from a stun with `bind_level` wraps still on it.
+signal woke(bind_level: int)
 
-enum State { LURKING, STALKING, ENRAGED, POLTERGEIST_THROW, STUNNED, CAPTURED }
+enum State { LURKING, STALKING, ENRAGED, POLTERGEIST_THROW, STUNNED, CAPTURED, POSSESSING }
+enum Evasion { SIDESTEP, BLACKOUT, SNAP_THROW }
 
 const Ragdoll := preload("res://scripts/DemonRagdoll.gd")
 const LevelBuilder := preload("res://scripts/LevelBuilder.gd")
@@ -28,7 +39,11 @@ const Player := preload("res://scripts/Player.gd")
 const FlickerLight := preload("res://scripts/FlickerLight.gd")
 const Mats := preload("res://scripts/MaterialLibrary.gd")
 
-const STATE_NAMES: Array[String] = ["LURKING", "STALKING", "ENRAGED", "POLTERGEIST", "STUNNED", "CAPTURED"]
+const STATE_NAMES: Array[String] = ["LURKING", "STALKING", "ENRAGED", "POLTERGEIST", "STUNNED", "CAPTURED", "POSSESSING"]
+## Per crew size (1-4 people): stun it shrugs off, how hard it thrashes, how heavy it hauls.
+const CREW_RESISTANCE: Array[float] = [1.0, 1.45, 1.85, 2.2]
+const CREW_STRUGGLE: Array[float] = [1.0, 1.25, 1.45, 1.6]
+const CREW_DRAG: Array[float] = [1.0, 1.35, 1.65, 1.9]
 const WALK_MASK := 1        # world
 const SIGHT_MASK := 1 | 8   # world and doors
 const CAST_COLOR := Color(1.0, 0.24, 0.06)
@@ -52,6 +67,7 @@ const CAST_COLOR := Color(1.0, 0.24, 0.06)
 @export var swipe_reach := 2.35
 @export var swipe_cooldown := 1.7
 @export var swipe_knockback := 7.5
+@export var swipe_damage := 28.0
 @export var throw_interval_min := 5.0
 @export var throw_interval_max := 8.0
 @export var throw_range := 10.0
@@ -60,6 +76,13 @@ const CAST_COLOR := Color(1.0, 0.24, 0.06)
 @export var telegraph_time := 0.65
 @export var levitate_height := 1.2
 @export var throw_spread := 0.045
+
+@export_group("Evasion")
+## Stun points of current it takes, awake, before it does something about it.
+@export var evade_threshold := 35.0
+@export var blackout_radius := 10.0
+@export var blackout_time_min := 6.0
+@export var blackout_time_max := 8.0
 
 @export_group("Haunting")
 @export var haunt_radius := 7.0
@@ -73,6 +96,12 @@ var is_discovered := false
 var throws_launched := 0
 var swipes_landed := 0
 var peak_haunt := 0.0
+var evasions := 0
+## A client's mirror of the host's brain: it thinks nothing, only haunts the lamps.
+var is_remote := false
+## What the body's mood looks like, for the wire (see `_update_mood`).
+var mood_rage := 0.0
+var mood_casting := false
 
 var _ragdoll: Ragdoll
 var _visuals: Node
@@ -120,6 +149,14 @@ var _cast_left := 0.0
 var _cast_launched := false
 var _recover_left := 0.0
 var _closing_time := 0.0
+## False when nobody on site is standing: it goes back to lurking.
+var _has_prey := true
+var _base: Dictionary = {}
+var _tier := 0
+var _crew := 1
+var _evade_next := 35.0
+var _stagger_left := 0.0
+var _hold_left := 0.0
 
 
 ## Wires the brain to the level and its prey. Called by Main after everything exists.
@@ -146,6 +183,11 @@ func setup(level: Node, player: Node) -> void:
 	_ragdoll.grabbed.connect(_on_grabbed)
 	_ragdoll.struggled.connect(_on_struggled)
 	_ragdoll.provoked.connect(_on_provoked)
+	_ragdoll.staggered.connect(_on_staggered)
+	_ragdoll.broke_out.connect(_on_broke_out)
+	_base = {"lurk": lurk_speed, "stalk": stalk_speed, "charge": charge_speed, "swipe": swipe_cooldown,
+			"throw_min": throw_interval_min, "throw_max": throw_interval_max}
+	_evade_next = evade_threshold
 	_fx_root = Node3D.new()
 	_fx_root.name = "PoltergeistFx"
 	add_child(_fx_root)
@@ -165,15 +207,90 @@ func get_state_name() -> String:
 ## Each contract the crew survives, the next demon is a little quicker, meaner and harder
 ## to put down. `tier` is the number of contracts already paid out.
 func apply_difficulty(tier: int) -> void:
-	var step := clampf(float(tier), 0.0, 8.0)
-	var quick := 1.0 + 0.06 * step
-	lurk_speed *= quick
-	stalk_speed *= quick
-	charge_speed *= quick
-	swipe_cooldown /= 1.0 + 0.05 * step
-	throw_interval_min /= 1.0 + 0.07 * step
-	throw_interval_max /= 1.0 + 0.07 * step
+	_tier = tier
+	_retune()
+
+
+## How many people are on site. One gets a hard, fair fight; two to four get a heavier,
+## faster, angrier demon that takes teamwork. Called again whenever somebody leaves.
+func set_player_count(count: int) -> void:
+	_crew = clampi(count, 1, CREW_RESISTANCE.size())
+	_retune()
+
+
+func get_player_count() -> int:
+	return _crew
+
+
+## Who it is after right now.
+func get_prey() -> Node3D:
+	return _player if is_instance_valid(_player) else null
+
+
+func _retune() -> void:
+	if _base.is_empty():
+		return
+	var step := clampf(float(_tier), 0.0, 8.0)
+	var extra := float(_crew - 1)
+	var quick := (1.0 + 0.06 * step) * (1.0 + 0.05 * extra)
+	lurk_speed = float(_base["lurk"]) * quick
+	stalk_speed = float(_base["stalk"]) * quick
+	charge_speed = float(_base["charge"]) * quick
+	swipe_cooldown = float(_base["swipe"]) / ((1.0 + 0.05 * step) * (1.0 + 0.12 * extra))
+	throw_interval_min = float(_base["throw_min"]) / ((1.0 + 0.07 * step) * (1.0 + 0.15 * extra))
+	throw_interval_max = float(_base["throw_max"]) / ((1.0 + 0.07 * step) * (1.0 + 0.15 * extra))
 	_ragdoll.stun_scale = 1.0 / (1.0 + 0.08 * step)
+	_ragdoll.max_stun_resistance = CREW_RESISTANCE[_crew - 1]
+	_ragdoll.struggle_force = CREW_STRUGGLE[_crew - 1]
+	_ragdoll.drag_mass = CREW_DRAG[_crew - 1]
+
+
+# --- Possession (driven by PossessionSystem) --------------------------------------------
+
+## Vanishes into a player: the body leaves the world until `leave_possession`.
+func enter_possession() -> void:
+	_release_casts(true)
+	_enter(State.POSSESSING)
+	_ragdoll.set_dormant(true)
+
+
+## Thrown back out at `at`: flat on the floor and stunned, or on its feet and furious.
+func leave_possession(at: Transform3D, stunned: bool) -> void:
+	_ragdoll.set_dormant(false)
+	_ragdoll.place(at)
+	_route.clear()
+	_stuck_anchor = _ragdoll.get_ground_position()
+	_evade_next = evade_threshold
+	if stunned:
+		_ragdoll.knock_out()
+	else:
+		_enter(State.ENRAGED)
+
+
+## Stands over its prey with its hands on them for `seconds` (the solo possession struggle).
+func hold_prey(seconds: float) -> void:
+	_hold_left = seconds
+	if _visuals:
+		_visuals.call(&"flash")
+	if _audio:
+		_audio.call(&"play_roar")
+
+
+## A client's copy of what the host's brain is doing.
+func apply_net(next: int, found: bool, in_van: bool, sealed_in: bool, rage: float, casting: bool) -> void:
+	is_in_van = in_van
+	is_sealed = sealed_in
+	mood_rage = rage
+	mood_casting = casting
+	next = clampi(next, 0, State.size() - 1)
+	if next != state:
+		state = next as State
+		state_changed.emit(state)
+	if found and not is_discovered:
+		is_discovered = true
+		discovered.emit()
+	if _visuals:
+		_visuals.call(&"set_mood", rage, _ragdoll.is_stunned, state == State.CAPTURED, casting)
 
 
 # --- Debug hotkeys (K / J / L / P in Main) ---------------------------------------------
@@ -224,8 +341,9 @@ func debug_summon() -> void:
 		GameState.post_notice("DEBUG  the demon is sealed in the van")
 		return
 	_discover()
-	var ahead := -_player.global_transform.basis.z
-	_ragdoll.place(Transform3D(Basis.looking_at(-ahead), _player.global_position + ahead * 3.2))
+	var summoner := GameState.local_player as Node3D if is_instance_valid(GameState.local_player) else _player as Node3D
+	var ahead := -summoner.global_transform.basis.z
+	_ragdoll.place(Transform3D(Basis.looking_at(-ahead), summoner.global_position + ahead * 3.2))
 	_route.clear()
 	_stuck_anchor = _ragdoll.get_ground_position()
 	GameState.post_notice("DEBUG  demon summoned")
@@ -234,23 +352,51 @@ func debug_summon() -> void:
 # --- Main loop ---------------------------------------------------------------------------
 
 func _physics_process(delta: float) -> void:
-	if _ragdoll == null or _player == null:
+	if _ragdoll == null:
 		return
+	if is_remote:
+		_haunt_lights(delta)
+		return
+	if not is_instance_valid(_player):
+		# Whoever it was after has left the site.
+		_player = null
+		_choose_prey()
+		if _player == null:
+			return
 	_state_time += delta
+	if state == State.POSSESSING:
+		_haunt_lights(delta)
+		_update_mood()
+		return
 	_sense(delta)
 	_haunt_lights(delta)
 	_update_van(delta)
-	match state:
-		State.LURKING:
-			_tick_lurking(delta)
-		State.STALKING:
-			_tick_stalking(delta)
-		State.ENRAGED:
-			_tick_enraged(delta)
-		State.POLTERGEIST_THROW:
-			_tick_throwing(delta)
-		_:
-			_halt()
+	_tick_evasion()
+	_stagger_left = maxf(0.0, _stagger_left - delta)
+	if not _has_prey and (state == State.STALKING or state == State.ENRAGED):
+		# Everyone is on the floor: nothing left to chase.
+		_enter(State.LURKING)
+	if _hold_left > 0.0 and not _ragdoll.is_stunned:
+		# Hands on its prey: it stands there and squeezes.
+		_hold_left -= delta
+		_ragdoll.pose = Ragdoll.Pose.CAST
+		_look_at_player(true)
+		_halt()
+		_face(_player.global_position)
+	elif _stagger_left > 0.0 and not _ragdoll.is_stunned and state != State.POLTERGEIST_THROW:
+		_halt()
+	else:
+		match state:
+			State.LURKING:
+				_tick_lurking(delta)
+			State.STALKING:
+				_tick_stalking(delta)
+			State.ENRAGED:
+				_tick_enraged(delta)
+			State.POLTERGEIST_THROW:
+				_tick_throwing(delta)
+			_:
+				_halt()
 	_tick_swipe(delta)
 	_update_mood()
 
@@ -284,7 +430,7 @@ func _enter(next: State) -> void:
 					_visuals.call(&"flash")
 				if _distance < 16.0:
 					_player.add_trauma(0.2 + 0.4 * (1.0 - _distance / 16.0))
-		State.STUNNED, State.CAPTURED:
+		State.STUNNED, State.CAPTURED, State.POSSESSING:
 			_halt()
 	state_changed.emit(state)
 
@@ -298,16 +444,44 @@ func _sense(delta: float) -> void:
 	if _sense_left > 0.0:
 		return
 	_sense_left = 0.12
+	_choose_prey()
 	var eyes := _player.global_position + Vector3.UP * 1.4
 	_sees_player = not _blocked(_ragdoll.get_head_position(), eyes, SIGHT_MASK)
 	var at := _player.global_position
 	_player_inside = at.x > LevelBuilder.HOUSE_WEST and at.x < LevelBuilder.HOUSE_EAST and at.z > LevelBuilder.HOUSE_NORTH and at.z < LevelBuilder.HOUSE_SOUTH
-	var view := _player.get_camera().global_transform
-	var aim := (chest - view.origin).normalized()
-	var facing := (-view.basis.z).dot(aim)
+	var aim := (chest - _player.get_view_origin()).normalized()
+	var facing := _player.get_view_forward().dot(aim)
 	_lit = _player.flashlight_on and _sees_player and _distance < torch_range and facing > cos(deg_to_rad(torch_cone_degrees))
 	if _sees_player and _distance < 14.0 and facing > 0.55:
 		_discover()
+
+
+## Picks who to hunt: the nearest player still on their feet, with a bias toward the one
+## it is already after so it does not dither between two people the same distance away.
+func _choose_prey() -> void:
+	var chest := _ragdoll.get_center()
+	var best: Player = null
+	var best_score := INF
+	var anyone: Player = null
+	for node in GameState.get_players():
+		var candidate := node as Player
+		if candidate == null:
+			continue
+		if anyone == null:
+			anyone = candidate
+		if not candidate.is_standing() or candidate.possessed:
+			continue
+		var score := candidate.global_position.distance_to(chest)
+		if candidate == _player:
+			score *= 0.7
+		if score < best_score:
+			best_score = score
+			best = candidate
+	_has_prey = best != null
+	if best:
+		_player = best
+	elif not is_instance_valid(_player):
+		_player = anyone
 
 
 func _discover() -> void:
@@ -332,7 +506,9 @@ func _update_mood() -> void:
 			rage = 0.7 if _freeze_left > 0.0 else 0.25
 		State.ENRAGED, State.POLTERGEIST_THROW:
 			rage = 1.0
-	_visuals.call(&"set_mood", rage, _ragdoll.is_stunned, state == State.CAPTURED, state == State.POLTERGEIST_THROW)
+	mood_rage = rage
+	mood_casting = state == State.POLTERGEIST_THROW
+	_visuals.call(&"set_mood", rage, _ragdoll.is_stunned, state == State.CAPTURED, mood_casting)
 
 
 # --- States ------------------------------------------------------------------------------
@@ -363,7 +539,7 @@ func _tick_lurking(delta: float) -> void:
 			_halt()
 			if _sees_player:
 				_face(_player.global_position)
-	if passive or _lurk_hold > 0.0:
+	if passive or _lurk_hold > 0.0 or not _has_prey:
 		return
 	if _player_inside or (_sees_player and _distance < notice_range):
 		_enter(State.STALKING)
@@ -482,6 +658,9 @@ func _tick_throwing(delta: float) -> void:
 # --- Stun, capture and being grabbed ------------------------------------------------------
 
 func _on_stun_changed(stunned: bool) -> void:
+	if is_remote:
+		return
+	_hold_left = 0.0
 	if stunned:
 		_discover()
 		_enter(State.STUNNED)
@@ -493,7 +672,9 @@ func _on_stun_changed(stunned: bool) -> void:
 	GameState.revoke_step(GameState.STEP_SEAL_VAN)
 	GameState.revoke_step(GameState.STEP_LOAD_DEMON)
 	GameState.revoke_step(GameState.STEP_SUBDUE_DEMON)
+	_evade_next = evade_threshold
 	_enter(State.ENRAGED)
+	woke.emit(_ragdoll.bind_level)
 
 
 ## Stunned with the torso in the cargo cage = captured. Shutting both doors on it seals it in.
@@ -531,16 +712,29 @@ func _update_van(delta: float) -> void:
 
 ## A rope round a limb or a jolt of current: whatever it was doing, it is angry now.
 func _on_provoked(by: Node) -> void:
+	if is_remote:
+		return
 	_discover()
-	if by == _player and (state == State.LURKING or state == State.STALKING):
+	var attacker := by as Player
+	if attacker == null:
+		return
+	if attacker.is_standing():
+		_player = attacker
+		_has_prey = true
+	if state == State.LURKING or state == State.STALKING:
 		_enter(State.ENRAGED)
 
 
 ## Laying hands on a conscious demon is answered at once.
 func _on_grabbed(by: Node, _part: int) -> void:
-	_discover()
-	if _ragdoll.is_stunned or by != _player:
+	if is_remote:
 		return
+	_discover()
+	var grabber := by as Player
+	if _ragdoll.is_stunned or grabber == null:
+		return
+	_player = grabber
+	_has_prey = true
 	if state == State.LURKING or state == State.STALKING:
 		_enter(State.ENRAGED)
 		_windup_left = 0.0
@@ -551,6 +745,121 @@ func _on_grabbed(by: Node, _part: int) -> void:
 func _on_struggled(strength: float) -> void:
 	if _audio and strength > 0.2 and _ragdoll.is_dragged():
 		_audio.call(&"play_rasp", 0.5 + strength * 0.6)
+
+
+## Shoved, or blown back by a second wind: it loses its footing for half a second.
+func _on_staggered(by: Node) -> void:
+	if is_remote or _ragdoll.is_stunned:
+		return
+	_stagger_left = 0.5
+	_swipe_left = maxf(_swipe_left, 0.7)
+	_hold_left = 0.0
+	if by:
+		_on_provoked(by)
+
+
+## It ripped a layer of tape off mid-haul: a crack, a shower of sparks, and everyone knows.
+func _on_broke_out(level_before: int) -> void:
+	if is_remote:
+		return
+	if _visuals:
+		_visuals.call(&"flash")
+	if _audio:
+		_audio.call(&"play_rasp", 1.4)
+	if is_instance_valid(GameState.net):
+		GameState.net.call(&"fx", &"snap", _ragdoll.get_center())
+	if level_before > 0:
+		GameState.post_notice("IT TORE THE TAPE OFF!  bind %d/3  -  tape it properly before you haul" % _ragdoll.bind_level)
+	else:
+		GameState.post_notice("IT WRENCHED FREE!  -  tape it [3] before you haul it")
+
+
+# --- Evasion --------------------------------------------------------------------------------
+
+## Awake and taking current, it does not just stand there. Every `evade_threshold` points
+## of stun it answers with one of three things, whichever the room allows.
+func _tick_evasion() -> void:
+	if _ragdoll.is_stunned or state == State.CAPTURED:
+		return
+	var meter := _ragdoll.stun_meter
+	if meter < 5.0:
+		_evade_next = evade_threshold
+		return
+	if meter < _evade_next or state == State.POLTERGEIST_THROW:
+		return
+	_evade_next = meter + evade_threshold
+	var options: Array[int] = [Evasion.SIDESTEP]
+	var props := _pick_throwables()
+	if not props.is_empty():
+		options.append(Evasion.SNAP_THROW)
+	if _lamps_near(_ragdoll.get_center()) > 0:
+		options.append(Evasion.BLACKOUT)
+		options.append(Evasion.BLACKOUT)
+	var choice := options[randi() % options.size()]
+	evasions += 1
+	match choice:
+		Evasion.SIDESTEP:
+			_sidestep()
+		Evasion.BLACKOUT:
+			_blow_lamps()
+		Evasion.SNAP_THROW:
+			_begin_cast(props)
+			# No long wind-up: this one is thrown from the hip.
+			_cast_left = 0.3
+			if state != State.ENRAGED:
+				_enter(State.ENRAGED)
+				_windup_left = 0.0
+			_enter(State.POLTERGEIST_THROW)
+			GameState.post_notice_for(_player, "IT ANSWERS WITH THE FURNITURE!")
+	evaded.emit(choice)
+
+
+## A shadow lunge out of the arc: hard sideways, to whichever side has room.
+func _sidestep() -> void:
+	var chest := _ragdoll.get_center()
+	var from_player := (chest - _player.global_position) * Vector3(1.0, 0.0, 1.0)
+	from_player = from_player.normalized() if from_player.length_squared() > 0.001 else _ragdoll.get_facing()
+	var side := from_player.cross(Vector3.UP)
+	if randf() < 0.5:
+		side = -side
+	if _blocked(chest, chest + side * 2.6, WALK_MASK):
+		side = -side
+	_ragdoll.nudge(side * 7.5 - from_player * 1.5 + Vector3.UP * 1.1)
+	_swipe_left = minf(_swipe_left, 0.25)
+	_route.clear()
+	_repath_left = 0.0
+	if _visuals:
+		_visuals.call(&"shadow_step")
+	if _audio:
+		_audio.call(&"play_whoosh", 0.7)
+	if is_instance_valid(GameState.net):
+		GameState.net.call(&"fx", &"shadow", chest)
+	GameState.post_notice_for(_player, "IT SLIPS THE CURRENT  -  rope it [1] to hold it still")
+
+
+## Every lamp and candle near it goes out for six to eight seconds. Headlamps still work.
+func _blow_lamps() -> void:
+	var chest := _ragdoll.get_center()
+	var seconds := randf_range(blackout_time_min, blackout_time_max)
+	if is_instance_valid(GameState.net):
+		GameState.net.call(&"blackout", chest, blackout_radius, seconds)
+	if _audio:
+		_audio.call(&"play_buzz", 1.4)
+		_audio.call(&"play_roar")
+	if _visuals:
+		_visuals.call(&"flash")
+	GameState.post_notice("THE LAMPS BLOW OUT  -  headlamps on [T]")
+
+
+func _lamps_near(chest: Vector3) -> int:
+	var count := 0
+	for node in get_tree().get_nodes_in_group(FlickerLight.GROUP):
+		var light := node.get_parent() as Node3D
+		if light and light.global_position.distance_to(chest) < blackout_radius and not (node as FlickerLight).is_blacked_out():
+			var at := light.global_position
+			if at.x > LevelBuilder.HOUSE_WEST and at.x < LevelBuilder.HOUSE_EAST and at.z > LevelBuilder.HOUSE_NORTH and at.z < LevelBuilder.HOUSE_SOUTH:
+				count += 1
+	return count
 
 
 # --- Swipe ---------------------------------------------------------------------------------
@@ -578,7 +887,7 @@ func _tick_swipe(delta: float) -> void:
 	var reach := 3.5 if _swipe_forced else swipe_reach
 	if flat.length() < reach and absf(to_player.y) < 1.7:
 		var away := flat.normalized() if flat.length_squared() > 0.001 else _ragdoll.get_facing()
-		if _player.knock_down(away * swipe_knockback + Vector3.UP * 2.6, _ragdoll):
+		if _player.knock_down(away * swipe_knockback + Vector3.UP * 2.6, _ragdoll, swipe_damage):
 			swipes_landed += 1
 			if _audio:
 				_audio.call(&"play_thud", 1.4)
@@ -660,6 +969,8 @@ func _launch(cast: Dictionary) -> void:
 	prop.linear_velocity = aim * speed + Vector3.UP * (0.5 * gravity * prop.gravity_scale * flight)
 	prop.angular_velocity = Vector3(randf_range(-6.0, 6.0), randf_range(-6.0, 6.0), randf_range(-6.0, 6.0))
 	prop.sleeping = false
+	# For the next couple of seconds this prop is a weapon: it hurts whoever it hits.
+	prop.set_meta(&"hurled_until", Time.get_ticks_msec() + 2500)
 	throws_launched += 1
 	get_tree().create_timer(0.8).timeout.connect(_end_cast.bind(cast))
 
@@ -747,7 +1058,7 @@ func _haunt_lights(delta: float) -> void:
 		return
 	_haunt_left = 0.1
 	var chest := _ragdoll.get_center()
-	var presence := 0.0 if state == State.CAPTURED else (0.35 if _ragdoll.is_stunned else 1.0)
+	var presence := 0.0 if state == State.CAPTURED or state == State.POSSESSING else (0.35 if _ragdoll.is_stunned else 1.0)
 	var strongest := 0.0
 	for node in get_tree().get_nodes_in_group(FlickerLight.GROUP):
 		var flicker := node as FlickerLight

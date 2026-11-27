@@ -27,6 +27,10 @@ signal struggled(strength: float)
 signal impacted(speed: float)
 ## Something a player did (a lasso, a shock) that a conscious demon will not let pass.
 signal provoked(by: Node)
+## A player shoved it, or something blew it back: it reels for a moment.
+signal staggered(by: Node)
+## It tore a layer of tape off mid-haul. `level_before` is the bind level it had.
+signal broke_out(level_before: int)
 
 enum Part { PELVIS, TORSO, HEAD, UPPER_ARM_L, LOWER_ARM_L, UPPER_ARM_R, LOWER_ARM_R, UPPER_LEG_L, LOWER_LEG_L, UPPER_LEG_R, LOWER_LEG_R }
 enum Pose { LURK, STALK, CHASE, CAST, FREEZE }
@@ -75,6 +79,13 @@ const AWAKE_DRAG_FORCE := 70.0
 const BIND_HOLD: Array[float] = [0.0, 0.45, 0.8, 1.2]
 ## Stun points a conscious demon shakes off per second once nothing is shocking it.
 const STUN_BLEED := 14.0
+## For this long after waking, current only does half its work: no stun-locking with slot 2.
+const SHOCK_RESIST_TIME := 4.0
+const SHOCK_RESIST := 0.5
+## Seconds of being hauled before it rips free, at bind level 0..3. Level 3 holds.
+const BREAKOUT_TIME: Array[float] = [6.5, 10.0, 28.0, INF]
+## Stun points a breakout costs it: it is closer to waking every time.
+const BREAKOUT_STUN_COST := 25.0
 
 # --- Intent, written by the AI ------------------------------------------------
 var pose: Pose = Pose.LURK
@@ -96,6 +107,22 @@ var stun_locked := false
 var contained := false
 ## Multiplies stun dealt to a conscious demon; later contracts bring tougher ones.
 var stun_scale := 1.0
+## Crew scaling, set by the brain from the number of people on site (all 1.0 for one):
+## how much stun it shrugs off, how hard it thrashes, and how heavy it is to haul.
+var max_stun_resistance := 1.0
+var struggle_force := 1.0
+var drag_mass := 1.0
+## Seconds of shock resistance left (see SHOCK_RESIST_TIME).
+var shock_resist_left := 0.0
+## 0..1: how close a hauled, badly taped demon is to ripping free.
+var breakout_tension := 0.0
+var breakouts := 0
+## Out of the world altogether: it is riding inside a player (see PossessionSystem).
+var is_dormant := false
+## A client's mirror of the host's demon: no simulation, bodies posed from the wire.
+var is_remote := false
+## On a client: how many of the crew the host says are hauling it.
+var net_haulers := 0
 ## Times the safety net had to rebuild the ragdoll (NaN, runaway speed, stretched joint). Should stay 0.
 var fault_count := 0
 var peak_speed := 0.0
@@ -142,6 +169,8 @@ var _struggle_left := 1.0
 var _strain := 0.0
 var _snag_time := 0.0
 var _holders: Dictionary = {}
+## Lasso -> true when that rope is pinned to an anchor, false while a player holds it.
+var _ropes: Dictionary = {}
 var _safe := Transform3D.IDENTITY
 var _safe_left := 0.0
 var _core_speed := 0.0
@@ -254,7 +283,9 @@ func place(xf: Transform3D) -> void:
 ## Adds stun; the demon collapses when the meter fills.
 func add_stun(amount: float) -> void:
 	if not is_stunned and amount > 0.0:
-		amount *= stun_scale
+		amount *= stun_scale / maxf(max_stun_resistance, 0.1)
+		if shock_resist_left > 0.0:
+			amount *= SHOCK_RESIST
 	stun_meter = clampf(stun_meter + amount, 0.0, 100.0)
 	if stun_meter >= 100.0 and not is_stunned:
 		_collapse()
@@ -296,9 +327,11 @@ func wake() -> void:
 	stun_meter = 0.0
 	stun_locked = false
 	contained = false
+	breakout_tension = 0.0
 	if not is_stunned:
 		return
 	is_stunned = false
+	shock_resist_left = SHOCK_RESIST_TIME
 	_support = 0.0
 	_apply_damping()
 	_bodies[Part.TORSO].apply_central_impulse(Vector3.UP * PART_MASS[Part.TORSO] * 2.4)
@@ -331,6 +364,109 @@ func nudge(velocity_change: Vector3) -> void:
 		_bodies[part].apply_central_impulse(velocity_change * PART_MASS[part])
 
 
+## A two-handed shove from a player. Awake it rocks back on its heels; limp it just slides.
+func shove(direction: Vector3, by: Node = null) -> void:
+	var push := Vector3(direction.x, 0.0, direction.z).normalized()
+	if is_stunned:
+		nudge(push * 1.6)
+		return
+	nudge(push * 2.6 + Vector3.UP * 0.6)
+	staggered.emit(by)
+
+
+## Thrown clear of `from` at `speed` m/s (a second wind, a broken possession grab).
+func blast_away(from: Vector3, speed: float, stun: float = 0.0) -> void:
+	var away := (get_center() - from) * Vector3(1.0, 0.0, 1.0)
+	away = away.normalized() if away.length_squared() > 0.001 else get_facing()
+	nudge(away * speed + Vector3.UP * 1.6)
+	if stun > 0.0:
+		add_stun(stun)
+	staggered.emit(null)
+
+
+## Takes the demon out of the world (it is inside a player) or puts it back. Dormant, it
+## has no colliders, casts nothing and drops out of every hand and rope.
+func set_dormant(active: bool) -> void:
+	if is_dormant == active:
+		return
+	is_dormant = active
+	visible = not active
+	for body in _bodies:
+		body.collision_layer = 0 if active else GameState.LAYER_DEMON
+		body.collision_mask = 0 if active else GameState.LAYER_WORLD | GameState.LAYER_PLAYER | GameState.LAYER_PROP | GameState.LAYER_INTERACT
+		if not is_remote:
+			body.freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
+			body.freeze = active
+			body.linear_velocity = Vector3.ZERO
+			body.angular_velocity = Vector3.ZERO
+	if active:
+		breakout_tension = 0.0
+		_ropes.clear()
+
+
+## Turns this ragdoll into a mirror of the host's: frozen bodies that NetSync moves.
+func set_remote() -> void:
+	is_remote = true
+	for body in _bodies:
+		body.freeze_mode = RigidBody3D.FREEZE_MODE_KINEMATIC
+		body.freeze = true
+		body.set_meta(&"net_mirror", true)
+
+
+## A client's copy of the numbers the host owns. Signals fire as they would on the host.
+func apply_net(meter: float, stunned: bool, level: int, caged: bool, sealed_in: bool, resisting: bool, dormant: bool) -> void:
+	stun_meter = meter
+	stun_locked = caged
+	contained = sealed_in
+	shock_resist_left = 1.0 if resisting else 0.0
+	if stunned != is_stunned:
+		is_stunned = stunned
+		stun_changed.emit(stunned)
+	if level != bind_level:
+		var before := bind_level
+		bind_level = level
+		bind_changed.emit(level)
+		if level < before and stunned:
+			broke_out.emit(before)
+	set_dormant(dormant)
+
+
+# --- Ropes --------------------------------------------------------------------------
+
+## A Holy Lasso has caught this demon, tied it off (`anchored`) or let it go.
+func notify_rope(rope: Node, attached: bool, anchored: bool) -> void:
+	if attached:
+		_ropes[rope] = anchored
+	else:
+		_ropes.erase(rope)
+
+
+## True while anybody's rope ties it to an anchor pin: it can be taped where it stands.
+func is_anchored() -> bool:
+	for rope: Variant in _ropes:
+		if is_instance_valid(rope) and _ropes[rope]:
+			return true
+	return false
+
+
+## How many of the crew are hauling it right now, by hand or on a rope they hold.
+func get_hauler_count() -> int:
+	return net_haulers if is_remote else _haulers().size()
+
+
+func _haulers() -> Array[Node]:
+	var crew: Array[Node] = []
+	for holder: Variant in _holders:
+		if is_instance_valid(holder) and not crew.has(holder):
+			crew.append(holder as Node)
+	for rope: Variant in _ropes:
+		if is_instance_valid(rope) and not _ropes[rope]:
+			var holder: Variant = (rope as Node).get(&"player")
+			if is_instance_valid(holder) and not crew.has(holder):
+				crew.append(holder as Node)
+	return crew
+
+
 # --- Being grabbed ------------------------------------------------------------------
 
 func notify_grab(body: RigidBody3D, by: Node) -> void:
@@ -357,10 +493,13 @@ func is_dragged() -> bool:
 ##   carry  weight that slows the carrier down
 func get_grab_tuning(body: RigidBody3D) -> Dictionary:
 	if is_stunned:
+		# A heavier demon for a bigger crew, and a bonus for every extra pair of hands on it:
+		# two people pulling together out-haul two people pulling in turn.
+		var teamwork := 1.0 + 0.2 * float(maxi(get_hauler_count() - 1, 0))
 		return {
 			"mass": body.mass * 3.0,
-			"force": DRAG_FORCE[bind_level],
-			"carry": DRAG_CARRY[bind_level],
+			"force": DRAG_FORCE[bind_level] / maxf(drag_mass, 0.1) * teamwork,
+			"carry": DRAG_CARRY[bind_level] * drag_mass / teamwork,
 		}
 	# Awake, it simply will not be hauled around.
 	return {"mass": body.mass * 0.6, "force": AWAKE_DRAG_FORCE, "carry": 6.0}
@@ -559,9 +698,10 @@ func _apply_damping() -> void:
 # --- Simulation ---------------------------------------------------------------------
 
 func _physics_process(delta: float) -> void:
-	if _bodies.is_empty():
+	if _bodies.is_empty() or is_remote or is_dormant:
 		return
 	_time += delta
+	shock_resist_left = maxf(0.0, shock_resist_left - delta)
 	_thud_left = maxf(0.0, _thud_left - delta)
 	_shock_left = maxf(0.0, _shock_left - delta)
 	_convulse_left -= delta
@@ -810,9 +950,10 @@ func _tick_limp(delta: float) -> void:
 			_topple(clampf(_fall_left / FALL_TIME, 0.0, 1.0))
 	if bind_level > 0:
 		_bind_drive()
+	_tick_breakout(delta, dragged)
 	_struggle_left -= delta
 	if _struggle_left <= 0.0 and not contained:
-		var strength := STRUGGLE[bind_level] * (1.0 if dragged else 0.25)
+		var strength := STRUGGLE[bind_level] * struggle_force * (1.0 if dragged else 0.25)
 		_struggle_left = randf_range(0.7, 1.5) * (1.0 + bind_level * 0.35) * (1.0 if dragged else 2.4)
 		_thrash(strength)
 		struggled.emit(strength)
@@ -827,6 +968,43 @@ func _tick_limp(delta: float) -> void:
 				_bodies[part].apply_central_impulse(hop * PART_MASS[part])
 	else:
 		_snag_time = maxf(0.0, _snag_time - delta * 2.0)
+
+
+## Hauled about with no tape on it, or only a wrap or two, it works itself loose: tension
+## builds unseen while anyone drags it, and when it tops out the demon rips a layer of tape
+## off (if it has one), throws whoever had hold of it backwards and loses a chunk of its
+## stun. Two wraps hold far longer; three hold for good. Left alone, the tension eases.
+func _tick_breakout(delta: float, dragged: bool) -> void:
+	var hauled := dragged or not _haulers().is_empty()
+	if not hauled or contained or stun_locked or bind_level >= 3:
+		breakout_tension = maxf(0.0, breakout_tension - delta * 0.12)
+		return
+	breakout_tension += delta / BREAKOUT_TIME[bind_level] * struggle_force
+	if breakout_tension >= 1.0:
+		_break_out()
+
+
+func _break_out() -> void:
+	var before := bind_level
+	breakout_tension = 0.0
+	breakouts += 1
+	var crew := _haulers()
+	var centre := get_center()
+	if bind_level > 0:
+		set_bind_level(bind_level - 1)
+	stun_meter = maxf(1.0, stun_meter - BREAKOUT_STUN_COST)
+	_thrash(1.7)
+	for rope: Variant in _ropes.keys():
+		if is_instance_valid(rope) and not _ropes[rope]:
+			(rope as Node).call(&"release_demon", self)
+	for hauler in crew:
+		var away := ((hauler as Node3D).global_position - centre) * Vector3(1.0, 0.0, 1.0)
+		away = away.normalized() if away.length_squared() > 0.001 else Vector3.BACK
+		if hauler.has_method(&"drop_held"):
+			hauler.call(&"drop_held")
+		if hauler.has_method(&"shoved"):
+			hauler.call(&"shoved", away * 6.0 + Vector3.UP * 2.6)
+	broke_out.emit(before)
 
 
 ## Tape does what tape does: wrapped arms stay by the ribs and (from the second wrap)
@@ -878,6 +1056,7 @@ func _holder_position() -> Vector3:
 
 func _collapse() -> void:
 	is_stunned = true
+	breakout_tension = 0.0
 	_support = 0.0
 	_struggle_left = randf_range(0.8, 1.4)
 	_apply_damping()

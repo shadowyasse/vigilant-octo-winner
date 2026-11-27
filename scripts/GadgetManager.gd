@@ -21,8 +21,12 @@ const GadgetAudio := preload("res://scripts/gadgets/GadgetAudio.gd")
 
 enum Slot { HANDS, LASSO, TASER, TAPE }
 
+## Wire size of the belt's drawable state (see `write_net`).
+const NET_FLOATS := HolyLasso.NET_FLOATS + HolyTaser.NET_FLOATS + DuctTape.NET_FLOATS
+const NET_INTS := HolyLasso.NET_INTS + HolyTaser.NET_INTS + DuctTape.NET_INTS
+
 const SLOT_TITLES: Array[String] = ["HANDS", "HOLY LASSO", "HOLY TASER", "DUCT TAPE"]
-const HANDS_HINT := "[LMB / E] Grab   [RMB] Throw   [1] Lasso   [2] Taser   [3] Duct tape"
+const HANDS_HINT := "[LMB / E] Grab   [RMB] Throw   [Q] Shove   [1] Lasso   [2] Taser   [3] Duct tape"
 ## Seconds to lower one tool, and again to raise the next.
 const SWAP_TIME := 0.15
 
@@ -95,6 +99,11 @@ func is_armed() -> bool:
 	return slot != Slot.HANDS
 
 
+## Whatever is in hand goes back on the belt.
+func holster() -> void:
+	_set_slot(Slot.HANDS)
+
+
 func get_title() -> String:
 	return SLOT_TITLES[slot]
 
@@ -129,6 +138,23 @@ func is_demon_anchored(demon: Node) -> bool:
 	return lasso.is_anchoring(demon)
 
 
+## The slot the body's owner reports having in hand (bodies driven from another machine).
+func follow_slot(index: int) -> void:
+	if not _player.is_local:
+		_set_slot(clampi(index, 0, _gadgets.size() - 1))
+
+
+func write_net(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
+	for i in range(1, _gadgets.size()):
+		_gadgets[i].write_net(floats, ints)
+
+
+func read_net(floats: PackedFloat32Array, f: int, ints: PackedInt32Array, i: int) -> void:
+	lasso.read_net(floats, f, ints, i)
+	taser.read_net(floats, f + HolyLasso.NET_FLOATS, ints, i + HolyLasso.NET_INTS)
+	tape.read_net(floats, f + HolyLasso.NET_FLOATS + HolyTaser.NET_FLOATS, ints, i + HolyLasso.NET_INTS + HolyTaser.NET_INTS)
+
+
 ## World position of the right glove; where a rope is held when no tool model is showing.
 func get_hand_position() -> Vector3:
 	return _model.get_palm_position(1)
@@ -151,7 +177,7 @@ func reset() -> void:
 # --- Input -------------------------------------------------------------------------
 
 func _unhandled_input(event: InputEvent) -> void:
-	if _player.controls_locked:
+	if not _player.is_local or _player.controls_locked:
 		return
 	var key := event as InputEventKey
 	if key and key.pressed and not key.echo:
@@ -165,7 +191,9 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_0:
 				_set_slot(Slot.HANDS)
 			KEY_R:
-				lasso.request_release()
+				# Lets go of the rope in hand, and slips one a crewmate has thrown round us.
+				_player.request(&"release")
+				_player.try_slip_leash()
 		return
 	var button := event as InputEventMouseButton
 	if button and button.pressed:
@@ -181,22 +209,27 @@ func _set_slot(index: int) -> void:
 	if slot != Slot.HANDS:
 		_gadgets[slot].holstered()
 	slot = index
-	audio.play(&"equip", (_player as Node3D).global_position + Vector3.UP * 1.2, -6.0)
+	if _player.is_local or not _player.simulates:
+		audio.play(&"equip", (_player as Node3D).global_position + Vector3.UP * 1.2, -6.0)
 	slot_changed.emit(slot)
 
 
-## Knocked flat, hauling something by hand, or looking at a menu: the tool hangs at the hip.
+## Knocked flat, downed, possessed, hauling something by hand, or looking at a menu: the
+## tool hangs at the hip.
 func _is_lowered() -> bool:
-	return _player.is_knocked_down() or _player.is_hand_grabbing() or _player.controls_locked
+	return not _player.can_act() or _player.is_hand_grabbing() or (_player.is_local and _player.controls_locked)
 
 
 func _physics_process(delta: float) -> void:
+	if not _player.simulates:
+		# A puppet belt: the host works these gadgets and `read_net` shows the result.
+		return
 	var usable := slot != Slot.HANDS and _shown == slot and _raise > 0.9 and not _is_lowered()
-	var fire_down := Input.is_action_pressed(&"gadget_fire")
+	var fire_down: bool = _player.in_fire
 	if not fire_down:
 		_fire_locked = false
 	var fire := usable and fire_down and not _fire_locked
-	var alt := usable and Input.is_action_pressed(&"gadget_alt")
+	var alt: bool = usable and _player.in_alt
 	var input := {"fire": fire, "fire_pressed": fire and not _was_fire, "fire_released": _was_fire and not fire, "alt_pressed": alt and not _was_alt}
 	_was_fire = fire
 	_was_alt = alt

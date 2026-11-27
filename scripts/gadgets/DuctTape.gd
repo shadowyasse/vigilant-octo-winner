@@ -14,6 +14,9 @@ const STUN_BONUS := 20.0
 const MAX_LEVEL := 3
 const RADIUS := 0.152
 const STRIP_STEPS := 8
+## Wire size: where the tape sticks, progress / flags.
+const NET_FLOATS := 4
+const NET_INTS := 1
 
 ## 0..1 of the wrap in progress.
 var progress := 0.0
@@ -116,7 +119,7 @@ func use(delta: float, input: Dictionary) -> void:
 	var check := _candidate()
 	if not check["ok"]:
 		if input["fire_pressed"]:
-			GameState.post_notice(str(check["reason"]))
+			notify(str(check["reason"]))
 			audio.call(&"play", &"dry", view.global_position)
 		return
 	_wrapped = true
@@ -155,7 +158,7 @@ func _candidate() -> Dictionary:
 		return {"ok": false, "reason": "Get within %.1f m of the demon to tape it" % RANGE}
 	if int(demon.get(&"bind_level")) >= MAX_LEVEL:
 		return {"ok": false, "reason": "Fully bound  -  haul it to the van"}
-	if not demon.get(&"is_stunned") and not manager.call(&"is_demon_anchored", demon):
+	if not demon.get(&"is_stunned") and not demon.call(&"is_anchored"):
 		return {"ok": false, "reason": "Stun it [2] or anchor it with the lasso [1] first"}
 	return {"ok": true, "demon": demon, "point": point}
 
@@ -188,6 +191,8 @@ func get_view_shift() -> Transform3D:
 
 
 func _process(_delta: float) -> void:
+	if is_puppet():
+		audio.call(&"set_loop", &"rip", wrapping, view.global_position, -3.0, 1.0 + progress * 0.25)
 	var paying := wrapping and view.visible and is_instance_valid(_demon)
 	_strip.visible = paying
 	_glints.emitting = paying
@@ -211,3 +216,17 @@ func _process(_delta: float) -> void:
 			_strip_mesh.surface_set_uv(Vector2(t * 3.0, edge * 0.5 + 0.5))
 			_strip_mesh.surface_add_vertex(centre + across * edge)
 	_strip_mesh.surface_end()
+
+
+# --- Replication -------------------------------------------------------------------------
+
+func write_net(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
+	floats.append_array(PackedFloat32Array([_stick.x, _stick.y, _stick.z, progress]))
+	ints.append(1 if wrapping else 0)
+
+
+func read_net(floats: PackedFloat32Array, f: int, ints: PackedInt32Array, i: int) -> void:
+	_stick = Vector3(floats[f], floats[f + 1], floats[f + 2])
+	progress = floats[f + 3]
+	wrapping = ints[i] != 0
+	_demon = find_demon() if wrapping else null

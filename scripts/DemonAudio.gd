@@ -20,6 +20,8 @@ var _rasp_stream: AudioStreamWAV
 var _rng := RandomNumberGenerator.new()
 ## How often each cue fired; lets tests confirm the hooks without listening.
 var cue_counts: Dictionary = {"roar": 0, "rasp": 0, "buzz": 0, "thud": 0, "whoosh": 0}
+## Set by the co-op host (see NetSync): each cue is passed on to the clients' demons.
+static var relay: Callable = Callable()
 
 
 ## Called by the ragdoll once its segments exist.
@@ -41,6 +43,8 @@ func _process(_delta: float) -> void:
 
 
 func play_roar() -> void:
+	if relay.is_valid():
+		relay.call(&"roar", 1.0)
 	_voice.stream = _roar_stream
 	_voice.pitch_scale = _rng.randf_range(0.88, 1.04)
 	_voice.volume_db = 6.0
@@ -50,6 +54,8 @@ func play_roar() -> void:
 
 ## Quiet, wet breathing rattle for when it is lurking or pinned.
 func play_rasp(loudness: float = 1.0) -> void:
+	if relay.is_valid():
+		relay.call(&"rasp", loudness)
 	if _voice.playing and _voice.stream == _roar_stream:
 		return
 	_voice.stream = _rasp_stream
@@ -60,6 +66,8 @@ func play_rasp(loudness: float = 1.0) -> void:
 
 
 func play_buzz(strength: float = 1.0) -> void:
+	if relay.is_valid():
+		relay.call(&"buzz", strength)
 	if _buzz.playing:
 		return
 	_buzz.pitch_scale = _rng.randf_range(0.92, 1.1)
@@ -69,6 +77,8 @@ func play_buzz(strength: float = 1.0) -> void:
 
 
 func play_thud(strength: float = 1.0) -> void:
+	if relay.is_valid():
+		relay.call(&"thud", strength)
 	_thud.pitch_scale = _rng.randf_range(0.82, 1.1)
 	_thud.volume_db = linear_to_db(clampf(strength, 0.2, 1.6))
 	_thud.play()
@@ -76,6 +86,8 @@ func play_thud(strength: float = 1.0) -> void:
 
 
 func play_whoosh(pitch: float = 1.0) -> void:
+	if relay.is_valid():
+		relay.call(&"whoosh", pitch)
 	_whoosh.pitch_scale = pitch * _rng.randf_range(0.93, 1.07)
 	_whoosh.play()
 	cue_counts["whoosh"] += 1

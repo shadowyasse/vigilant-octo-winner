@@ -1,28 +1,43 @@
 extends Node3D
-## Entry point. Builds the night atmosphere (environment, fog, moon), asks the
-## LevelBuilder for the site, then drops in the player, the HUD, the demon and
-## the ContractManager that runs the capture-to-payout loop.
+## Entry point of a contract. Builds the night atmosphere (environment, fog, moon), asks
+## the LevelBuilder for the site, then drops in one exorcist per person in the session,
+## the HUD, the demon, and the systems that run the job: ContractManager (capture to
+## payout, or failure), PossessionSystem, NetSync and the pause menu.
 ## Main.tscn contains only this script: everything else is constructed on run.
+##
+## Solo is one body. Co-op is one body per connected player, and nothing else: there
+## are no bots and no bystanders anywhere on the site. With `backdrop` set, only the
+## site and its weather are built, for the title screen to film.
 
 const LevelBuilder := preload("res://scripts/LevelBuilder.gd")
 const PlayerScene := preload("res://scenes/Player.tscn")
-const ExorcistModel := preload("res://scripts/ExorcistModel.gd")
 const HudScene := preload("res://scenes/HUD.tscn")
 const DemonScene := preload("res://scenes/Demon.tscn")
 const ContractManager := preload("res://scripts/ContractManager.gd")
+const PossessionSystem := preload("res://scripts/PossessionSystem.gd")
+const NetSync := preload("res://scripts/NetSync.gd")
+const PauseMenu := preload("res://scripts/PauseMenu.gd")
 
 const FOG_COLOR := Color(0.16, 0.20, 0.27)
 const KILL_PLANE_Y := -25.0
 const DEBUG_KEYS := "Test keys:  K stun / wake demon   J cycle AI (lurking > enraged > poltergeist throw)   L cycle bind level 0-3   P summon demon   F1 show on HUD"
 
-## 0 orange, 1 teal, 2 olive, 3 purple.
+## Solo suit colour: 0 orange, 1 teal, 2 olive, 3 purple. Co-op players pick theirs in the lobby.
 @export var suit_variant := 0
+## Title screen: build the site and its weather, and nothing that plays.
+@export var backdrop := false
 
 var level: LevelBuilder
+## The body this machine controls.
 var player: CharacterBody3D
+## Peer id -> body, for everyone on site (one entry in solo).
+var players: Dictionary = {}
 var hud: CanvasLayer
 var demon: Node3D
 var contracts: ContractManager
+var possession: PossessionSystem
+var net: NetSync
+var pause_menu: PauseMenu
 
 
 func _ready() -> void:
@@ -32,20 +47,23 @@ func _ready() -> void:
 	level = LevelBuilder.new()
 	level.name = "Level"
 	add_child(level)
+	if backdrop:
+		_build_interior_air()
+		_tune_lights(self)
+		return
 
-	player = PlayerScene.instantiate() as CharacterBody3D
-	player.transform = level.player_spawn
-	add_child(player)
-	player.call(&"set_suit", suit_variant)
+	# A prop's place in this list is its id on the wire: identical on every machine.
+	GameState.net_props = level.get_props()
+	for i in GameState.net_props.size():
+		GameState.net_props[i].set_meta(&"net_id", i)
 
+	_spawn_crew()
 	hud = HudScene.instantiate() as CanvasLayer
 	add_child(hud)
 	hud.call(&"bind_player", player)
 
 	_spawn_demon(0)
 	print(DEBUG_KEYS)
-
-	_spawn_squad()
 	_build_interior_air()
 	_tune_lights(self)
 
@@ -53,6 +71,82 @@ func _ready() -> void:
 	contracts.name = "Contracts"
 	add_child(contracts)
 	contracts.setup(self)
+
+	possession = PossessionSystem.new()
+	possession.name = "Possession"
+	add_child(possession)
+	possession.setup(self)
+
+	net = NetSync.new()
+	net.name = "Net"
+	add_child(net)
+	net.setup(self)
+
+	pause_menu = PauseMenu.new()
+	pause_menu.name = "PauseMenu"
+	add_child(pause_menu)
+	pause_menu.setup(self)
+
+	NetworkManager.player_left.connect(_on_player_left)
+	NetworkManager.announce_ready()
+
+
+func _exit_tree() -> void:
+	if NetworkManager.player_left.is_connected(_on_player_left):
+		NetworkManager.player_left.disconnect(_on_player_left)
+	GameState.net_props = []
+
+
+## One body per person in the session. This machine's own goes in first, so its camera
+## is the one the viewport uses.
+func _spawn_crew() -> void:
+	var local_id := NetworkManager.local_id()
+	_spawn_player(local_id)
+	for id in NetworkManager.get_ids():
+		if id != local_id:
+			_spawn_player(id)
+
+
+func _spawn_player(id: int) -> void:
+	var local := id == NetworkManager.local_id()
+	var seat := NetworkManager.get_seat(id)
+	var body := PlayerScene.instantiate() as CharacterBody3D
+	body.name = "Player" if local else "Player%d" % id
+	body.set(&"peer_id", id)
+	body.set(&"seat", seat)
+	body.set(&"display_name", NetworkManager.get_player_name(id))
+	body.set(&"is_local", local)
+	# Hands, gadgets and impacts are worked out where the world is: here in solo and on the host.
+	body.set(&"simulates", NetworkManager.is_authority())
+	body.transform = level.get_spawn(seat)
+	if not local:
+		(body.get_node("Head/SpringArm3D/Camera3D") as Camera3D).current = false
+	add_child(body)
+	body.call(&"set_suit", NetworkManager.get_player_suit(id) if NetworkManager.is_networked() else suit_variant)
+	players[id] = body
+	if local:
+		player = body
+
+
+## Somebody dropped out mid-contract: their body goes, anything they held is let go, and
+## the demon is re-scaled for the crew that is left.
+func _on_player_left(id: int) -> void:
+	var body := players.get(id) as CharacterBody3D
+	if body == null:
+		return
+	players.erase(id)
+	var who := str(body.get(&"display_name"))
+	if is_instance_valid(possession):
+		possession.forget(body)
+	for other: Node in players.values():
+		var belt: Variant = other.get(&"gadgets")
+		if is_instance_valid(belt):
+			(belt as Node).get(&"lasso").call(&"release_player", body)
+	remove_child(body)
+	body.queue_free()
+	if is_instance_valid(demon):
+		demon.get_node("AI").call(&"set_player_count", NetworkManager.get_player_count())
+	GameState.notice_posted.emit("%s LEFT THE SITE" % who)
 
 
 ## Clears out the last demon (sealed in the van or not) and wakes a new one on the dais.
@@ -64,6 +158,8 @@ func respawn_demon(tier: int) -> Node3D:
 		demon.queue_free()
 	_spawn_demon(tier)
 	_tune_lights(demon)
+	if is_instance_valid(possession):
+		possession.bind_demon(demon)
 	return demon
 
 
@@ -75,13 +171,26 @@ func _spawn_demon(tier: int) -> void:
 	var brain := demon.get_node("AI")
 	brain.call(&"setup", level, player)
 	brain.call(&"apply_difficulty", tier)
+	brain.call(&"set_player_count", NetworkManager.get_player_count())
+	if not NetworkManager.is_authority():
+		# The host's demon is the real one; this is its mirror.
+		demon.call(&"set_remote")
+		brain.set(&"is_remote", true)
 	hud.call(&"bind_demon", demon)
 
 
-## Test keys (listed on the HUD under F1). They act on the demon's brain, exactly as gameplay would.
+## Where this machine's player starts a contract.
+func get_local_spawn() -> Transform3D:
+	return level.get_spawn(int(player.get(&"seat")))
+
+
+## Test keys (listed on the HUD under F1). They act on the demon's brain, exactly as gameplay
+## would, so in co-op only the host (who owns that brain) has them.
 func _unhandled_input(event: InputEvent) -> void:
 	var key := event as InputEventKey
-	if key == null or not key.pressed or key.echo or not is_instance_valid(demon) or player.get(&"controls_locked"):
+	if key == null or not key.pressed or key.echo or backdrop or not is_instance_valid(demon) or player.get(&"controls_locked"):
+		return
+	if not NetworkManager.is_authority():
 		return
 	var brain := demon.get_node("AI")
 	match key.physical_keycode:
@@ -97,9 +206,9 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _physics_process(_delta: float) -> void:
 	# Safety net: anyone who escapes the map is put back beside the van.
-	if player.global_position.y < KILL_PLANE_Y:
+	if is_instance_valid(player) and player.global_position.y < KILL_PLANE_Y:
 		player.velocity = Vector3.ZERO
-		player.global_transform = level.player_spawn
+		player.global_transform = get_local_spawn()
 
 
 func _build_environment() -> void:
@@ -220,29 +329,6 @@ func _build_moon() -> void:
 	add_child(disc)
 
 
-## The rest of the crew, idling around the van in the other suit colours.
-func _spawn_squad() -> void:
-	for i in level.squad_spots.size():
-		var body := StaticBody3D.new()
-		body.name = "Crew%d" % (i + 1)
-		body.collision_layer = GameState.LAYER_WORLD
-		body.collision_mask = 0
-		body.transform = level.squad_spots[i]
-		var capsule := CapsuleShape3D.new()
-		capsule.radius = 0.34
-		capsule.height = 1.8
-		var shape := CollisionShape3D.new()
-		shape.shape = capsule
-		shape.position.y = 0.9
-		body.add_child(shape)
-		var model := ExorcistModel.new()
-		model.name = "Model"
-		model.showcase = true
-		model.suit = posmod(suit_variant + 1 + i, ExorcistModel.SUIT_COLORS.size()) as ExorcistModel.Suit
-		body.add_child(model)
-		add_child(body)
-
-
 ## Warm, dusty air inside the house so lamps and torch beams scatter amber
 ## indoors against the cold slate fog outside.
 func _build_interior_air() -> void:
@@ -276,8 +362,16 @@ func _tune_lights(node: Node) -> void:
 			light.shadow_bias = 0.05
 			light.shadow_normal_bias = 1.2
 			light.shadow_blur = 1.2
-		if not player.is_ancestor_of(light):
+		if not _worn_by_player(light):
 			light.distance_fade_enabled = true
 			light.distance_fade_begin = 42.0
 			light.distance_fade_length = 10.0
 			light.distance_fade_shadow = 26.0
+
+
+## True for a light that travels with an exorcist (headlamp, suit glow, hand lamp).
+func _worn_by_player(light: Node) -> bool:
+	for body: Node in players.values():
+		if is_instance_valid(body) and body.is_ancestor_of(light):
+			return true
+	return false

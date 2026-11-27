@@ -4,16 +4,19 @@ extends "res://scripts/gadgets/Gadget.gd"
 ## Holding LMB throws jagged arcs up to 3.8 m. Targeting is generous: a ray, then
 ## a fat ball swept down the same line, then anything of the demon inside a cone,
 ## because nobody aims well at a thrashing horror in the dark. A shocked demon
-## gains 48 stun a second and convulses; loose props get a spark and a shove.
+## gains 30 stun a second and convulses; loose props get a spark and a shove.
+## A crewmate caught in the arc takes no damage at all, only two and a half seconds
+## of helpless cartwheeling. A possessed one is being exorcised instead.
 ##
-## The battery drains 32 %/s, recharges 24 %/s after 0.6 s of rest, and running it
-## flat vents steam and locks the trigger for 2.8 s.
+## The battery drains 25 %/s (four seconds of trigger: one charge is just enough to put a
+## fresh demon down if every moment of it lands), recharges 24 %/s after 0.6 s of rest,
+## and running it flat vents steam and locks the trigger for 2.8 s.
 
 const RANGE := 3.8
 const CAST_RADIUS := 0.38
 const CONE_DEGREES := 24.0
-const STUN_RATE := 48.0
-const DRAIN := 32.0
+const STUN_RATE := 30.0
+const DRAIN := 25.0
 const RECHARGE := 24.0
 const RECHARGE_DELAY := 0.6
 const OVERHEAT_TIME := 2.8
@@ -22,8 +25,11 @@ const ARC_BLUE := Color(0.6, 0.85, 1.0)
 const ARC_GOLD := Color(1.0, 0.86, 0.5)
 const LED_OK := Color(0.2, 0.95, 1.0)
 const LED_LOW := Color(1.0, 0.16, 0.1)
-const TARGET_MASK := 4 | 16
-const SOLID_MASK := 1 | 4 | 8 | 16
+const TARGET_MASK := 2 | 4 | 16
+const SOLID_MASK := 1 | 2 | 4 | 8 | 16
+## Wire size: hit point, battery, overheat / target, flags.
+const NET_FLOATS := 5
+const NET_INTS := 2
 
 ## 0..100.
 var battery := 100.0
@@ -35,7 +41,7 @@ var overheats := 0
 
 var _fired := false
 var _rest := RECHARGE_DELAY
-var _target: RigidBody3D
+var _target: Node3D
 var _hit := Vector3.ZERO
 var _has_hit := false
 var _shove_left := 0.0
@@ -135,7 +141,7 @@ func _build_effects(root: Node3D) -> void:
 	_light = OmniLight3D.new()
 	_light.name = "ArcLight"
 	_light.light_color = Color(0.68, 0.86, 1.0)
-	_light.omni_range = 5.5
+	_light.omni_range = 4.5
 	_light.omni_attenuation = 1.3
 	_light.shadow_enabled = false
 	_light.top_level = true
@@ -174,7 +180,7 @@ func reset() -> void:
 func use(delta: float, input: Dictionary) -> void:
 	if input["fire_pressed"] and overheat_left > 0.0:
 		audio.call(&"play", &"dry", _muzzle.global_position)
-		GameState.post_notice("TASER OVERHEATED  -  %.1f s" % overheat_left)
+		notify("TASER OVERHEATED  -  %.1f s" % overheat_left)
 	if not input["fire"] or overheat_left > 0.0 or battery <= 0.0:
 		return
 	_fired = true
@@ -216,7 +222,7 @@ func _overheat() -> void:
 	_steam.emitting = true
 	audio.call(&"play", &"hiss", _muzzle.global_position, 2.0)
 	audio.call(&"play", &"beep", _muzzle.global_position, -2.0)
-	GameState.post_notice("TASER OVERHEATED!")
+	notify("TASER OVERHEATED!")
 
 
 ## A ray, then a fat ball down the same line, then anything of the demon inside the cone.
@@ -272,12 +278,21 @@ func _acquire() -> void:
 
 
 func _shockable(body: Object) -> bool:
+	if _is_crewmate(body):
+		return true
 	var rigid := body as RigidBody3D
 	return rigid != null and not rigid.freeze and (rigid.has_meta(&"demon") or rigid.is_in_group(GameState.GROUP_GRABBABLE))
 
 
+func _is_crewmate(body: Object) -> bool:
+	return body is Node and body != player and (body as Node).is_in_group(GameState.GROUP_PLAYER)
+
+
 func _shock(delta: float) -> void:
 	if not is_instance_valid(_target):
+		return
+	if _is_crewmate(_target):
+		_shock_crewmate(delta)
 		return
 	var demon := demon_of(_target)
 	if demon:
@@ -289,7 +304,24 @@ func _shock(delta: float) -> void:
 	if _shove_left <= 0.0:
 		_shove_left = 0.22
 		var push: Vector3 = (player.get_aim_forward() + Vector3.UP * 0.5).normalized()
-		_target.apply_impulse(push * minf(_target.mass * 1.4, 4.5), _hit - _target.global_position)
+		var prop := _target as RigidBody3D
+		prop.apply_impulse(push * minf(prop.mass * 1.4, 4.5), _hit - prop.global_position)
+
+
+## Friendly fire. Nobody is hurt: a clean crewmate cartwheels across the room, and a
+## possessed one has the demon burned out of them (a second and a half of current).
+func _shock_crewmate(delta: float) -> void:
+	var possession: Variant = GameState.possession
+	if _target.get(&"possessed"):
+		if is_instance_valid(possession):
+			(possession as Node).call(&"exorcise", _target, delta, player)
+		return
+	var away: Vector3 = player.get_aim_forward()
+	away.y = 0.0
+	away = away.normalized() if away.length_squared() > 0.001 else Vector3.FORWARD
+	if not _target.call(&"is_tumbling"):
+		GameState.post_notice("%s TASED %s  -  no harm done" % [str(player.display_name), str(_target.get(&"display_name"))])
+	_target.call(&"tumble", away * 5.5 + Vector3.UP * 3.6)
 
 
 # --- Arcs, light and the battery bar ----------------------------------------------------
@@ -306,7 +338,17 @@ func animate(delta: float) -> void:
 		_idle_show = 0.06
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
+	if is_puppet():
+		_time += delta
+		audio.call(&"set_loop", &"buzz", firing, _muzzle.global_position, -2.0, 1.0)
+		_steam.emitting = overheat_left > 0.0
+		if firing and is_instance_valid(_target):
+			# The host convulses the limbs; the electric rim is drawn here.
+			var demon := demon_of(_target)
+			var visuals := demon.get_node_or_null("Visuals") if demon else null
+			if visuals:
+				visuals.call(&"set_shock", 1.0)
 	_update_leds()
 	var idle_arc := _idle_show > 0.0 and view.visible and not firing
 	_bolts.visible = firing or idle_arc
@@ -333,8 +375,9 @@ func _process(_delta: float) -> void:
 		_bolt(left, end, 0.011, ARC_BLUE, 0.16, eye, true)
 		_bolt(right, end, 0.009, ARC_GOLD, 0.2, eye, true)
 		_bolt(_muzzle.global_position, end, 0.006, Color.WHITE, 0.1, eye, false)
-		_light.global_position = end.lerp(_muzzle.global_position, 0.3)
-		_light.light_energy = randf_range(1.4, 4.6)
+		# Kept well back from the target and dim: the arc lights the room, it must not bleach the demon.
+		_light.global_position = end.lerp(_muzzle.global_position, 0.6)
+		_light.light_energy = randf_range(0.5, 1.5)
 		_sparks.global_position = end
 	_bolt_mesh.surface_end()
 
@@ -385,3 +428,20 @@ func _update_leds() -> void:
 		var on := (i < lit and not overheat_left > 0.0) or blink
 		_leds[i].emission = LED_LOW if low else LED_OK
 		_leds[i].emission_energy_multiplier = 1.7 if on else 0.05
+
+
+# --- Replication -------------------------------------------------------------------------
+
+func write_net(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
+	floats.append_array(PackedFloat32Array([_hit.x, _hit.y, _hit.z, battery, overheat_left]))
+	ints.append(GameState.body_ref(_target) if firing else 0)
+	ints.append((1 if firing else 0) | (2 if _has_hit else 0))
+
+
+func read_net(floats: PackedFloat32Array, f: int, ints: PackedInt32Array, i: int) -> void:
+	_hit = Vector3(floats[f], floats[f + 1], floats[f + 2])
+	battery = floats[f + 3]
+	overheat_left = floats[f + 4]
+	_target = GameState.ref_body(ints[i])
+	firing = ints[i + 1] & 1 != 0
+	_has_hit = ints[i + 1] & 2 != 0

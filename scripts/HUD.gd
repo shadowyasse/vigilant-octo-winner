@@ -3,13 +3,17 @@ extends CanvasLayer
 ##   top-right    contract banner (number, bank balance, task text, progress bar);
 ##                once the demon has been found, a status strip under it (AI state,
 ##                stun decay bar, bind pips)
-##   bottom-left  stamina bar and the gadget belt: three drawn slot icons with
-##                their keys, the taser's battery and the lasso's status
+##   bottom-left  health bar (with the solo second-wind pip), stamina bar and the
+##                gadget belt: three drawn slot icons with their keys, the taser's
+##                battery and the lasso's status
 ##   bottom-right control hints for whatever is in hand
 ##   centre       reactive crosshair with a context prompt underneath and the
 ##                duct tape's wrap ring round it
-##   top-left     collapsible list of the test keys (F1)
-##   full screen  red edge vignette that flashes when the player is knocked down
+##   top-left     collapsible list of the test keys (F1); in co-op, the crew roster
+##                under it (name, health, DOWN / POSSESSED)
+##   full screen  red edge vignette: a flash on a knockdown, a blood edge at low
+##                health, a crimson pulse while possessed; the second-wind blackout;
+##                the POSSESSION STRUGGLE overlay; DOWNED and revive read-outs
 
 const Crosshair := preload("res://scripts/Crosshair.gd")
 const SlotIcon := preload("res://scripts/GadgetSlotIcon.gd")
@@ -21,13 +25,17 @@ const ACCENT := Color(0.95, 0.42, 0.08)
 const TEAL := Color(0.25, 0.92, 0.82)
 const WARN := Color(0.95, 0.27, 0.15)
 const GOLD := Color(1.0, 0.78, 0.3)
-const CONTROLS_HINT := "WASD move   SHIFT sprint   SPACE jump   CTRL crouch   F use   V camera   T torch\n1 lasso   2 taser   3 duct tape   0 / wheel: hands   E always grabs by hand"
+const CONTROLS_HINT := "WASD move   SHIFT sprint   SPACE jump   CTRL crouch   F use   Q shove   V camera   T torch   ESC menu\n1 lasso   2 taser   3 duct tape   0 / wheel: hands   E always grabs by hand (hold on a downed crewmate to revive)"
 const DEBUG_HINT_CLOSED := "F1  test keys"
 const DEBUG_HINT_OPEN := "F1  hide test keys\nK   stun / wake the demon\nJ   cycle AI: lurking > enraged > poltergeist throw\nL   cycle bind level 0-3\nP   summon the demon in front of you"
 const HINT_DURATION := 16.0
 const NOTICE_DURATION := 3.5
 ## Demon AI state index -> label colour (LURKING, STALKING, ENRAGED, POLTERGEIST, STUNNED, CAPTURED).
-const DEMON_STATE_COLORS: Array[Color] = [DIM, INK, WARN, ACCENT, TEAL, TEAL]
+const DEMON_STATE_COLORS: Array[Color] = [DIM, INK, WARN, ACCENT, TEAL, TEAL, WARN]
+const BLOOD := Color(0.72, 0.05, 0.07)
+const BLOOD_DARK := Color(0.34, 0.02, 0.04)
+## Health fraction under which the screen edge starts to bleed.
+const LOW_HEALTH := 0.4
 
 var _root: Control
 var _title: Label
@@ -70,6 +78,21 @@ var _gadgets: Node
 var _bank_target := 0
 var _bank_shown := 0.0
 var _bank_flash := 0.0
+## The player this HUD belongs to; polled for health, conditions and co-op read-outs.
+var _player: Node
+var _health: ProgressBar
+var _health_fill: StyleBoxFlat
+var _health_value: Label
+var _health_target := 1.0
+var _wind_pip: Label
+var _status: Label
+var _status_bar: ProgressBar
+var _synergy: Label
+var _blackout: ColorRect
+var _eyes: Control
+var _roster: VBoxContainer
+var _roster_rows: Dictionary = {}
+var _clock := 0.0
 
 
 func _ready() -> void:
@@ -85,6 +108,7 @@ func _ready() -> void:
 	_build_status()
 	_build_reticle()
 	_build_messages()
+	_build_conditions()
 	GameState.objective_changed.connect(_on_objective_changed)
 	GameState.notice_posted.connect(_on_notice_posted)
 	GameState.bank_changed.connect(_on_bank_changed)
@@ -100,8 +124,11 @@ func bind_player(player: Node) -> void:
 	player.connect(&"aim_changed", _on_aim_changed)
 	player.connect(&"knocked_down", _on_player_knocked_down)
 	player.connect(&"recovered", _on_player_recovered)
+	player.connect(&"health_changed", _on_health_changed)
 	_on_stamina_changed(player.get(&"stamina"), player.get(&"max_stamina"))
+	_on_health_changed(player.get(&"hp"), player.get(&"max_hp"))
 	_gadgets = player.get(&"gadgets")
+	_player = player
 
 
 ## Hooks the status strip up to the demon (its ragdoll root with an `AI` child). Called
@@ -147,6 +174,23 @@ func is_demon_status_visible() -> bool:
 	return _demon_panel.visible
 
 
+func get_health_bar() -> ProgressBar:
+	return _health
+
+
+## The big line in the middle of the screen (DOWNED, POSSESSED, SECOND WIND...), "" when clear.
+func get_status_text() -> String:
+	return _status.text if _status.visible else ""
+
+
+func get_synergy_text() -> String:
+	return _synergy.text if _synergy.visible else ""
+
+
+func get_vignette_alpha() -> float:
+	return _vignette.modulate.a
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	var key := event as InputEventKey
 	if key and key.pressed and not key.echo and key.physical_keycode == KEY_F1:
@@ -167,9 +211,16 @@ func _process(delta: float) -> void:
 		_hint_left -= delta
 		_hint.modulate.a = clampf(_hint_left / 2.0, 0.0, 1.0) * 0.85
 
-	# Red at the edges: a hard flash on impact, a faint hold while still on the floor.
+	_clock += delta
+	_health.value = lerpf(_health.value, _health_target, minf(1.0, delta * 10.0))
+	_health_fill.bg_color = BLOOD.lerp(Color(1.0, 0.16, 0.12), 0.5 + 0.5 * sin(_clock * 9.0)) if _health_target < LOW_HEALTH else BLOOD
+	# Red at the edges: a hard flash on impact, a faint hold while still on the floor, a
+	# slow bleed as health runs out and a crimson pulse with a demon aboard.
 	_vignette_flash = maxf(0.0, _vignette_flash - delta * 1.6)
 	var edge := maxf(_vignette_flash, 0.32 if _player_down else 0.0)
+	if is_instance_valid(_player):
+		edge = maxf(edge, _condition_edge())
+		_update_conditions()
 	_vignette.modulate.a = lerpf(_vignette.modulate.a, edge, minf(1.0, delta * 12.0))
 
 	if _demon_found and is_instance_valid(_demon):
@@ -355,6 +406,28 @@ func _build_status() -> void:
 	column.add_theme_constant_override(&"separation", 6)
 	column.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_root.add_child(column)
+	# Health sits right above stamina: a dark crimson bar, with the solo auto-injector beside its caption.
+	var health_head := _row(column)
+	var health_caption := _label("HEALTH", 11, DIM)
+	health_caption.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	health_head.add_child(health_caption)
+	_wind_pip = _label("", 10, GOLD)
+	_wind_pip.name = "SecondWind"
+	health_head.add_child(_wind_pip)
+	_health_value = _label("100", 11, INK)
+	_health_value.custom_minimum_size = Vector2(26.0, 0.0)
+	_health_value.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	health_head.add_child(_health_value)
+	_health = _bar(BLOOD, 10.0)
+	_health.name = "Health"
+	_health.custom_minimum_size = Vector2(198.0, 10.0)
+	_health.value = 1.0
+	_health_fill = _health.get_theme_stylebox(&"fill") as StyleBoxFlat
+	var health_back := _health.get_theme_stylebox(&"background") as StyleBoxFlat
+	health_back.bg_color = Color(BLOOD_DARK, 0.75)
+	health_back.border_color = Color(0.0, 0.0, 0.0, 0.7)
+	health_back.set_border_width_all(1)
+	column.add_child(_health)
 	column.add_child(_label("STAMINA", 11, DIM))
 	_stamina = _bar(TEAL, 10.0)
 	_stamina.custom_minimum_size = Vector2(198.0, 10.0)
@@ -472,6 +545,229 @@ func _build_messages() -> void:
 	_root.add_child(_debug_hint)
 
 
+## Everything Stage 4 can do to a player: the centre-screen status line and its meter,
+## the co-op drag read-out, the second-wind blackout, the struggle's eyes, the crew roster.
+func _build_conditions() -> void:
+	_blackout = ColorRect.new()
+	_blackout.name = "Blackout"
+	_blackout.color = Color(0.0, 0.0, 0.0, 0.0)
+	_blackout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_blackout.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_root.add_child(_blackout)
+	_root.move_child(_blackout, 1)
+	_eyes = DemonEyes.new()
+	_eyes.name = "DemonEyes"
+	_eyes.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_eyes.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_eyes.visible = false
+	_root.add_child(_eyes)
+	_root.move_child(_eyes, 2)
+
+	_status = _label("", 26, WARN)
+	_status.name = "Status"
+	_status.anchor_left = 0.5
+	_status.anchor_right = 0.5
+	_status.anchor_top = 0.5
+	_status.anchor_bottom = 0.5
+	_status.offset_left = -480.0
+	_status.offset_right = 480.0
+	_status.offset_top = 104.0
+	_status.offset_bottom = 172.0
+	_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_status.visible = false
+	_root.add_child(_status)
+	_status_bar = _bar(WARN, 9.0)
+	_status_bar.name = "StatusMeter"
+	_status_bar.anchor_left = 0.5
+	_status_bar.anchor_right = 0.5
+	_status_bar.anchor_top = 0.5
+	_status_bar.anchor_bottom = 0.5
+	_status_bar.offset_left = -150.0
+	_status_bar.offset_right = 150.0
+	_status_bar.offset_top = 178.0
+	_status_bar.offset_bottom = 187.0
+	_status_bar.visible = false
+	_root.add_child(_status_bar)
+	_synergy = _label("", 14, GOLD)
+	_synergy.name = "Synergy"
+	_synergy.anchor_left = 0.5
+	_synergy.anchor_right = 0.5
+	_synergy.anchor_top = 0.5
+	_synergy.anchor_bottom = 0.5
+	_synergy.offset_left = -200.0
+	_synergy.offset_right = 200.0
+	_synergy.offset_top = 72.0
+	_synergy.offset_bottom = 92.0
+	_synergy.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_synergy.visible = false
+	_root.add_child(_synergy)
+
+	_roster = VBoxContainer.new()
+	_roster.name = "Crew"
+	_roster.offset_left = 24.0
+	_roster.offset_top = 128.0
+	_roster.add_theme_constant_override(&"separation", 4)
+	_roster.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_roster.visible = false
+	_root.add_child(_roster)
+
+
+## How red the edge of the screen should be for the player's condition alone.
+func _condition_edge() -> float:
+	var edge := 0.0
+	var health := float(_player.get(&"hp")) / maxf(float(_player.get(&"max_hp")), 1.0)
+	if health < LOW_HEALTH:
+		# Blood creeping in from the edges, throbbing faster the less there is left.
+		var need := 1.0 - health / LOW_HEALTH
+		edge = need * (0.34 + 0.12 * sin(_clock * (3.0 + 5.0 * need)))
+	if _player.get(&"is_downed"):
+		edge = maxf(edge, 0.55 + 0.1 * sin(_clock * 3.0))
+	if _player.get(&"possessed"):
+		edge = maxf(edge, 0.5 + 0.3 * sin(_clock * 6.5))
+	if float(_player.call(&"get_struggle")) >= 0.0:
+		edge = maxf(edge, 0.7 + 0.25 * sin(_clock * 17.0))
+	return maxf(edge, 0.5 * float(_player.call(&"get_hurt_flash")))
+
+
+func _update_conditions() -> void:
+	var alone := NetworkManager.get_player_count() <= 1
+	_wind_pip.text = ("SECOND WIND  READY" if _player.get(&"second_wind_ready") else "SECOND WIND  USED") if alone else ""
+	_wind_pip.add_theme_color_override(&"font_color", GOLD if _player.get(&"second_wind_ready") else DIM)
+
+	var text := ""
+	var color := WARN
+	var meter := -1.0
+	var wind := float(_player.call(&"get_second_wind"))
+	var struggle := float(_player.call(&"get_struggle"))
+	# Second wind: the lights go out, then come back in a white surge.
+	_blackout.color = Color(0.0, 0.0, 0.0, 0.0)
+	if wind >= 0.0:
+		var dark := smoothstep(0.0, 0.18, wind) * (1.0 - smoothstep(0.78, 1.0, wind))
+		_blackout.color = Color(0.0, 0.0, 0.0, 0.94 * dark)
+		text = "FLATLINING...\nAUTO-INJECTOR FIRING" if wind < 0.6 else "SECOND WIND!"
+		color = GOLD
+		meter = wind
+	elif struggle >= 0.0:
+		text = "POSSESSION STRUGGLE\nMASH [SPACE]!"
+		meter = struggle
+	elif _player.get(&"is_downed"):
+		var helper := _reviver()
+		if helper:
+			text = "%s IS GETTING YOU UP..." % str(helper.get(&"display_name"))
+			color = TEAL
+			meter = float(helper.get(&"revive_progress"))
+		elif alone:
+			text = "DOWN"
+		else:
+			text = "DOWNED\ncrawl to a crewmate  -  they hold [E] to revive you"
+	elif _player.get(&"possessed"):
+		text = "YOU ARE POSSESSED\nget to the salt circle  -  or get tased"
+	elif _player.call(&"is_leashed"):
+		var leash: Dictionary = _player.call(&"get_leash")
+		var holder := GameState.get_player_at_seat(int(leash["by"]))
+		var who := str(holder.get(&"display_name")) if holder else "A CREWMATE"
+		text = "%s BY %s\nmash [SPACE]%s" % ["PINNED" if leash["anchored"] else "ROPED", who, "  or press [R]" if float(leash["time"]) >= 2.0 else "  -  [R] in %.0f s" % ceilf(2.0 - float(leash["time"]))]
+		color = GOLD
+		meter = float(leash["mash"]) / 6.0
+	elif int(_player.get(&"revive_seat")) >= 0:
+		var patient := GameState.get_player_at_seat(int(_player.get(&"revive_seat")))
+		text = "REVIVING %s..." % (str(patient.get(&"display_name")) if patient else "CREWMATE")
+		color = TEAL
+		meter = float(_player.get(&"revive_progress"))
+	_eyes.visible = struggle >= 0.0
+	if _eyes.visible:
+		_eyes.queue_redraw()
+	_status.visible = not text.is_empty()
+	if _status.visible:
+		_status.text = text
+		_status.add_theme_color_override(&"font_color", color)
+	_status_bar.visible = meter >= 0.0
+	if _status_bar.visible:
+		_status_bar.value = clampf(meter, 0.0, 1.0)
+		(_status_bar.get_theme_stylebox(&"fill") as StyleBoxFlat).bg_color = color
+
+	# Hauling the demon alongside somebody else: say so.
+	var haulers := int(_demon.call(&"get_hauler_count")) if is_instance_valid(_demon) else 0
+	_synergy.visible = haulers >= 2 and _is_hauling()
+	if _synergy.visible:
+		_synergy.text = "CO-OP DRAG x%d" % haulers
+		_synergy.modulate.a = 0.75 + 0.25 * sin(_clock * 6.0)
+	_update_roster(alone)
+
+
+## The standing crewmate who is holding E on this player, if anyone is.
+func _reviver() -> Node:
+	var seat := int(_player.get(&"seat"))
+	for other in GameState.get_players():
+		if other != _player and int(other.get(&"revive_seat")) == seat:
+			return other
+	return null
+
+
+## True while this player has hold of the demon, by hand or on their rope.
+func _is_hauling() -> bool:
+	var held: Variant = _player.call(&"get_held")
+	if is_instance_valid(held) and (held as Node).has_meta(&"demon"):
+		return true
+	if is_instance_valid(_gadgets):
+		var roped: Variant = (_gadgets.get(&"lasso") as Node).call(&"get_target")
+		return is_instance_valid(roped) and (roped as Node).has_meta(&"demon")
+	return false
+
+
+## Co-op only: one line per crewmate with their health and anything that needs doing about them.
+func _update_roster(alone: bool) -> void:
+	_roster.visible = not alone
+	if alone:
+		return
+	var seen: Dictionary = {}
+	for other in GameState.get_players():
+		if other == _player:
+			continue
+		var key := other.get_instance_id()
+		seen[key] = true
+		var row: Label = _roster_rows.get(key)
+		if row == null:
+			row = _label("", 12, INK)
+			_roster.add_child(row)
+			_roster_rows[key] = row
+		var state := "%3d HP" % int(ceil(float(other.get(&"hp"))))
+		var tint := INK
+		if other.get(&"is_downed"):
+			state = "DOWN  -  hold [E]"
+			tint = WARN
+		elif other.get(&"possessed"):
+			state = "POSSESSED"
+			tint = ACCENT
+		row.text = "%s   %s" % [str(other.get(&"display_name")), state]
+		row.add_theme_color_override(&"font_color", tint)
+	for key: int in _roster_rows.keys():
+		if not seen.has(key):
+			(_roster_rows[key] as Label).queue_free()
+			_roster_rows.erase(key)
+
+
+## The demon's eyes, burning across the screen for the length of a possession struggle.
+class DemonEyes extends Control:
+	func _draw() -> void:
+		var clock := Time.get_ticks_msec() * 0.001
+		var centre := size * 0.5 + Vector2(sin(clock * 31.0), cos(clock * 27.0)) * 9.0
+		var spread := size.x * 0.17
+		var flare := 0.75 + 0.25 * sin(clock * 23.0)
+		for side: float in [-1.0, 1.0]:
+			var at := centre + Vector2(side * spread, -size.y * 0.06)
+			# A slanted, glowing slit: wide halo, hot core, black pupil.
+			for layer: Vector3 in [Vector3(1.0, 0.12, 0.16), Vector3(0.62, 0.3, 0.42), Vector3(0.34, 0.75, 0.9)]:
+				var half := Vector2(size.x * 0.085, size.y * 0.035) * layer.x
+				var points := PackedVector2Array()
+				for i in 24:
+					var angle := TAU * float(i) / 24.0
+					var p := Vector2(cos(angle) * half.x, sin(angle) * half.y)
+					points.append(at + p.rotated(-0.22 * side))
+				draw_colored_polygon(points, Color(1.0, 0.32 * layer.z + 0.1, 0.03, layer.y * flare))
+			draw_circle(at, size.y * 0.012, Color(0.02, 0.0, 0.0, 0.9))
+
+
 # --- Signal handlers ------------------------------------------------------------
 
 func _on_objective_changed(title: String, task: String, progress: float, done: int, total: int) -> void:
@@ -503,6 +799,14 @@ func _money(amount: int) -> String:
 
 func _on_stamina_changed(current: float, maximum: float) -> void:
 	_stamina_target = current / maxf(maximum, 0.001)
+
+
+func _on_health_changed(current: float, maximum: float) -> void:
+	var before := _health_target
+	_health_target = current / maxf(maximum, 0.001)
+	_health_value.text = "%d" % int(ceil(current))
+	if _health_target < before - 0.001:
+		_vignette_flash = maxf(_vignette_flash, 0.85)
 
 
 func _on_aim_changed(kind: int, prompt: String) -> void:

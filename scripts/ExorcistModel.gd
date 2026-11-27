@@ -14,6 +14,7 @@ signal pose_updated
 
 const Mats := preload("res://scripts/MaterialLibrary.gd")
 const ViewArms := preload("res://scripts/FirstPersonArms.gd")
+const Parts := preload("res://scripts/gadgets/GadgetParts.gd")
 
 enum Suit { ORANGE, TEAL, OLIVE, PURPLE }
 
@@ -46,7 +47,6 @@ static var _glove_meshes: Dictionary = {}
 
 @export var suit: Suit = Suit.ORANGE
 ## Idle crew member: plays idle loops with the odd wave instead of following a controller.
-@export var showcase := false
 
 var _rig: Node3D
 var _skeleton: Skeleton3D
@@ -83,7 +83,14 @@ var _sway := Vector2.ZERO
 var _last_view_basis := Basis.IDENTITY
 var _stride_phase := 0.0
 var _hand_world: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
-var _showcase_wait := 0.0
+## Parts that could not be given a shadow twin: in first person they fall back to casting shadows only.
+var _shadow_toggle: Array[GeometryInstance3D] = []
+var _local_body := false
+var _possessed := false
+var _possession_smoke: GPUParticles3D
+var _possession_glow: OmniLight3D
+var _tumbling := false
+var _tumble_angle := 0.0
 var _knocked := false
 
 # First-person arms: smooth sleeves and gloves that stand in for the rig's faceted ones.
@@ -107,8 +114,7 @@ var _strain := 0.0
 func _ready() -> void:
 	_build()
 	apply_suit(suit)
-	set_headlamp(showcase)
-	_showcase_wait = randf_range(4.0, 12.0)
+	set_headlamp(false)
 
 
 ## Recolours the suit and visor. Index wraps, so any player number is valid.
@@ -173,17 +179,69 @@ func get_palm_position(side: int = 1) -> Vector3:
 	return get_hand_position(side)
 
 
-## In first person the head, the harness and their gear only cast shadows, so the camera
-## never looks out through its own mask or past its own shoulder straps; the body stays visible.
+## In first person the gloves follow the view. The torso, head and harness are not hidden
+## here: the local player's sit on their own render layer (see `set_local_body`) and the
+## first-person camera simply does not draw that layer.
 func set_first_person(enabled: bool) -> void:
 	_first_person = enabled
 	var cast := GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY if enabled else GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-	for part in _head_parts:
-		part.cast_shadow = cast
-	for part in _chest_gear:
+	for part in _shadow_toggle:
 		part.cast_shadow = cast
 	for part in _fallback_parts:
 		part.visible = not enabled
+
+
+## Marks this model as the one the local camera looks out of. Its torso (with the rig's own
+## arms), head, mask and harness move to GameState.RENDER_OWN_BODY, which the first-person
+## camera culls, so looking straight down never shows the inside of the chest. Legs and
+## boots stay on the normal layer. Godot 4.3 drops shadow casters the camera cannot see,
+## so each moved mesh leaves a shadow-only twin behind on the normal layer.
+func set_local_body() -> void:
+	if _local_body:
+		return
+	_local_body = true
+	var parts: Array[GeometryInstance3D] = []
+	for mesh in _body_meshes:
+		if mesh.name.contains("Body") and not _head_parts.has(mesh):
+			parts.append(mesh)
+	parts.append_array(_head_parts)
+	parts.append_array(_chest_gear)
+	for part in parts:
+		var mesh := part as MeshInstance3D
+		if mesh == null or mesh.mesh == null:
+			_shadow_toggle.append(part)
+			continue
+		if mesh.cast_shadow != GeometryInstance3D.SHADOW_CASTING_SETTING_OFF:
+			var twin := MeshInstance3D.new()
+			twin.name = "%sShadow" % mesh.name
+			twin.mesh = mesh.mesh
+			twin.skin = mesh.skin
+			twin.transform = mesh.transform
+			twin.extra_cull_margin = mesh.extra_cull_margin
+			twin.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY
+			mesh.get_parent().add_child(twin)
+			twin.skeleton = mesh.skeleton
+			mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		mesh.layers = GameState.RENDER_OWN_BODY
+
+
+## Demon inside: the visor burns red-orange, ash pours off the suit and a dull glow leaks out.
+func set_possessed(active: bool) -> void:
+	if _possessed == active:
+		return
+	_possessed = active
+	if active and _possession_smoke == null:
+		_build_possession_fx()
+	if _possession_smoke:
+		_possession_smoke.emitting = active
+		_possession_glow.visible = active
+	if not active:
+		apply_suit(suit)
+
+
+## Zapped by a crewmate's taser: the whole figure cartwheels until told to stop.
+func set_tumble(active: bool) -> void:
+	_tumbling = active
 
 
 ## World position of the hardhat lamp lens; the player's torch shines from here.
@@ -220,7 +278,7 @@ func set_headlamp(on: bool) -> void:
 	_lamp_material.emission_energy_multiplier = 4.0 if on else 0.05
 
 
-## One-shot gesture (showcase crew); returns to the idle loop afterwards.
+## One-shot gesture (a shove); returns to the idle loop afterwards.
 func play_gesture(clip: String) -> void:
 	if _anim and _anim.has_animation(clip):
 		_anim.play(clip, 0.25)
@@ -250,6 +308,23 @@ func _process(delta: float) -> void:
 	var turn_euler := turn.get_euler()
 	_sway = _sway.lerp(Vector2(turn_euler.y, turn_euler.x) * 0.9, minf(1.0, delta * 10.0)).limit_length(0.08)
 
+	# Tumbling spins the figure about its waist; anything else stands it back up.
+	if _tumbling:
+		_tumble_angle += delta * 10.0
+	elif _tumble_angle != 0.0:
+		_tumble_angle = 0.0
+		transform = Transform3D.IDENTITY
+	if _tumbling:
+		var spin := Basis(Vector3.RIGHT, _tumble_angle) * Basis(Vector3.BACK, _tumble_angle * 0.37)
+		var waist := Vector3(0.0, 0.9, 0.0)
+		transform = Transform3D(spin, waist - spin * waist * 0.35)
+	if _possessed:
+		var burn := 3.6 + 2.4 * sin(_clock * 9.0) + 1.2 * sin(_clock * 23.0)
+		_visor_material.albedo_color = Color(0.5, 0.1, 0.02)
+		_visor_material.emission = Color(1.0, 0.26, 0.04)
+		_visor_material.emission_energy_multiplier = burn
+		_possession_glow.light_energy = 0.5 + 0.12 * burn
+
 	# Backpack status LED: a slow green heartbeat.
 	_led_material.emission_energy_multiplier = 3.0 if fmod(_clock, 1.4) < 0.12 else 0.15
 	_update_clip(delta)
@@ -257,12 +332,6 @@ func _process(delta: float) -> void:
 
 func _update_clip(delta: float) -> void:
 	if _anim == null or _knocked:
-		return
-	if showcase:
-		_showcase_wait -= delta
-		if _showcase_wait <= 0.0:
-			_showcase_wait = randf_range(9.0, 20.0)
-			play_gesture(CLIP_WAVE if randf() < 0.5 else CLIP_INTERACT)
 		return
 	var clip := CLIP_IDLE
 	var rate := 1.0
@@ -494,9 +563,7 @@ func _build() -> void:
 
 	_dress_rig()
 	_build_gear()
-	# Only a player-driven exorcist is ever seen through its own eyes.
-	if not showcase:
-		_build_view_arms()
+	_build_view_arms()
 
 	var modifier := PoseModifier.new()
 	modifier.name = "PoseModifier"
@@ -508,8 +575,6 @@ func _build() -> void:
 			if _anim.has_animation(clip):
 				_anim.get_animation(clip).loop_mode = Animation.LOOP_LINEAR
 		_anim.play(CLIP_IDLE)
-		if showcase:
-			_anim.seek(randf() * 1.6, true)
 	for i in 2:
 		_hand_world[i] = _skeleton.global_transform * _skeleton.get_bone_global_rest(_bone("Wrist.%s" % SIDES[i])).origin
 
@@ -565,6 +630,24 @@ func _build_view_arms() -> void:
 	_view_arms.name = "FirstPersonArms"
 	add_child(_view_arms)
 	_view_arms.build(_sleeve_material, Mats.glow(Color(0.5, 0.53, 0.5), 0.12), glove, guard)
+
+
+## Ash smoke off the shoulders and a furnace glow at the visor (see `set_possessed`).
+func _build_possession_fx() -> void:
+	_possession_smoke = Parts.particles(Color(0.06, 0.05, 0.05, 0.6), 46, 1.5, Vector2(0.15, 0.7), Vector2(0.16, 0.44),
+			Vector3(0.0, 0.8, 0.0), 40.0, false, false)
+	_possession_smoke.name = "PossessionSmoke"
+	_possession_smoke.position = Vector3(0.0, 1.15, 0.0)
+	add_child(_possession_smoke)
+	_possession_glow = OmniLight3D.new()
+	_possession_glow.name = "PossessionGlow"
+	_possession_glow.light_color = Color(1.0, 0.3, 0.06)
+	_possession_glow.omni_range = 2.6
+	_possession_glow.omni_attenuation = 1.6
+	_possession_glow.shadow_enabled = false
+	_possession_glow.position = Vector3(0.0, 1.62, -0.25)
+	_possession_glow.visible = false
+	add_child(_possession_glow)
 
 
 ## Shows the first-person arms in place of the rig's own (or puts the rig's back).

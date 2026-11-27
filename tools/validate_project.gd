@@ -3,7 +3,9 @@ extends SceneTree
 ##   godot --headless --path . -s tools/validate_project.gd
 ## Every script must compile, every scene must load and instantiate, every shader
 ## must load, and every `res://` path written in a script, scene or project.godot
-## must exist. Exits 0 when clean, 1 otherwise.
+## must exist, and every autoload registered in project.godot (GameState, NetworkManager,
+## ModelLoader) must be live under the root with its script running. Exits 0 when clean,
+## 1 otherwise.
 
 const ROOTS: Array[String] = ["res://autoload", "res://scripts", "res://scenes", "res://shaders", "res://tools"]
 
@@ -25,12 +27,30 @@ func _initialize() -> void:
 			"gdshader":
 				_check_shader(path)
 		_check_paths(path)
+	_check_autoloads()
 	print("validate_project: %d scripts, %d scenes, %d shaders, %d resource paths checked" % [
 			_counts["scripts"], _counts["scenes"], _counts["shaders"], _counts["paths"]])
 	for failure in _failures:
 		printerr("  FAIL  %s" % failure)
 	print("validate_project: %s (%d problems)" % ["OK" if _failures.is_empty() else "FAILED", _failures.size()])
 	quit(0 if _failures.is_empty() else 1)
+
+
+## Autoloads are created before this script runs: each one has to be there, with its script.
+func _check_autoloads() -> void:
+	var names: Array[String] = []
+	for property in ProjectSettings.get_property_list():
+		var key := str(property["name"])
+		if key.begins_with("autoload/"):
+			names.append(key.trim_prefix("autoload/"))
+	for required: String in ["GameState", "NetworkManager"]:
+		if not names.has(required):
+			_failures.append("project.godot: autoload '%s' is not registered" % required)
+	for autoload in names:
+		var node := root.get_node_or_null(autoload)
+		if node == null or node.get_script() == null:
+			_failures.append("autoload '%s' did not load" % autoload)
+	print("validate_project: autoloads %s" % ", ".join(names))
 
 
 func _walk(dir_path: String, out: Array[String]) -> void:

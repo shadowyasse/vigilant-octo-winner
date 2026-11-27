@@ -286,11 +286,13 @@ func _physics_process(_delta: float) -> bool:
 				Input.action_release(&"jump")
 				_check("Space jumps", _player.velocity.y > 2.0, "%.1f m/s" % _player.velocity.y)
 			if _step_tick == 100:
+				# Stage 4: no bots and no bystanders. Solo means exactly one exorcist on site.
 				var crew := 0
 				for child in _main.get_children():
 					if String(child.name).begins_with("Crew"):
 						crew += 1
-				_check("squad of three is on site", crew == 3)
+				var exorcists := root.get_tree().get_nodes_in_group(&"player").size()
+				_check("solo is one exorcist and no NPC crew", crew == 0 and exorcists == 1, "%d NPC, %d exorcist(s)" % [crew, exorcists])
 				_next()
 		7:  # the demon, lurking: stands, haunts the candles, can be targeted
 			if _step_tick == 1:

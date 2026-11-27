@@ -27,6 +27,7 @@ var _time := 0.0
 var _dropout_left := 0.0
 var _haunt := 0.0
 var _haunt_clock := 0.0
+var _blackout_left := 0.0
 
 
 func _ready() -> void:
@@ -36,6 +37,15 @@ func _ready() -> void:
 	_noise.frequency = 0.35
 	_noise.seed = randi()
 	_time = randf() * 100.0
+
+
+## Blown out by the demon: dead for `seconds`, then it stutters back to life.
+func blackout(seconds: float) -> void:
+	_blackout_left = maxf(_blackout_left, seconds)
+
+
+func is_blacked_out() -> bool:
+	return _blackout_left > 0.0
 
 
 ## Current haunt strength (0..1) after smoothing.
@@ -64,6 +74,11 @@ func _process(delta: float) -> void:
 		var surge := 1.25 + 0.25 * _noise.get_noise_1d(_haunt_clock * 60.0)
 		var haunted := 0.04 if gate < -0.08 else surge
 		level *= lerpf(1.0, haunted, _haunt)
+
+	if _blackout_left > 0.0:
+		_blackout_left -= delta
+		# Dead, apart from a dying ember of a filament and a stutter in the last half second.
+		level *= (0.5 if fmod(_time * 7.0, 1.0) < 0.35 else 0.02) if _blackout_left < 0.5 else 0.0
 
 	if _light:
 		_light.light_energy = base_energy * level

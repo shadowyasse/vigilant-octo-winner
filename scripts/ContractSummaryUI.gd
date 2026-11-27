@@ -4,10 +4,16 @@ extends CanvasLayer
 ## Built in code like the HUD. `show_summary()` takes the dictionary from
 ## ContractManager.compute_payout() (plus "bank"); the total counts up, and the
 ## two buttons emit `next_pressed` / `explore_pressed` (Enter and Esc do the same).
+## `show_failure()` turns the same card into the CONTRACT FAILED incident report:
+## $0, head office's remarks, and RETRY CONTRACT / MAIN MENU (`retry_pressed`,
+## `menu_pressed`). In co-op only the host decides what happens next, so a client's
+## first button is greyed out until the host has pressed theirs.
 ## The whole screen swallows mouse clicks while the card is up.
 
 signal next_pressed
 signal explore_pressed
+signal retry_pressed
+signal menu_pressed
 
 const INK := Color(0.93, 0.95, 0.92)
 const DIM := Color(0.60, 0.67, 0.68)
@@ -18,6 +24,11 @@ const WARN := Color(0.95, 0.27, 0.15)
 const PANEL := Color(0.025, 0.032, 0.04, 0.95)
 
 var _root: Control
+var _kicker: Label
+var _total_caption: Label
+var _keys: Label
+var _card_style: StyleBoxFlat
+var _failed := false
 var _header: Label
 var _sub: Label
 var _rows: VBoxContainer
@@ -60,6 +71,7 @@ func _ready() -> void:
 	card_style.content_margin_right = 34.0
 	card_style.content_margin_top = 26.0
 	card_style.content_margin_bottom = 26.0
+	_card_style = card_style
 	var card := PanelContainer.new()
 	card.name = "Card"
 	card.custom_minimum_size = Vector2(560.0, 0.0)
@@ -69,7 +81,8 @@ func _ready() -> void:
 	column.add_theme_constant_override(&"separation", 10)
 	card.add_child(column)
 
-	column.add_child(_label("EXTRACTION REPORT", 12, DIM))
+	_kicker = _label("EXTRACTION REPORT", 12, DIM)
+	column.add_child(_kicker)
 	_header = _label("", 30, GOLD)
 	column.add_child(_header)
 	_sub = _label("", 14, DIM)
@@ -80,6 +93,7 @@ func _ready() -> void:
 	column.add_child(_rows)
 	column.add_child(_rule())
 	var total_row := _row(column, "TOTAL PAYOUT", 18, INK)
+	_total_caption = total_row.get_child(0) as Label
 	_total = _label("$0", 30, GOLD)
 	total_row.add_child(_total)
 	var bank_row := _row(column, "BANK", 14, DIM)
@@ -93,14 +107,33 @@ func _ready() -> void:
 	buttons.add_theme_constant_override(&"separation", 14)
 	column.add_child(buttons)
 	_next = _button("NEXT CONTRACT", ACCENT)
-	_next.pressed.connect(func() -> void: next_pressed.emit())
+	_next.pressed.connect(_on_first_pressed)
 	buttons.add_child(_next)
 	_explore = _button("KEEP EXPLORING", Color(0.2, 0.24, 0.27))
-	_explore.pressed.connect(func() -> void: explore_pressed.emit())
+	_explore.pressed.connect(_on_second_pressed)
 	buttons.add_child(_explore)
-	var keys := _label("[ENTER] next contract     [ESC] keep exploring", 11, Color(DIM, 0.8))
-	keys.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	column.add_child(keys)
+	_keys = _label("[ENTER] next contract     [ESC] keep exploring", 11, Color(DIM, 0.8))
+	_keys.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	column.add_child(_keys)
+
+
+func _on_first_pressed() -> void:
+	if _failed:
+		retry_pressed.emit()
+	else:
+		next_pressed.emit()
+
+
+func _on_second_pressed() -> void:
+	if _failed:
+		menu_pressed.emit()
+	else:
+		explore_pressed.emit()
+
+
+## True while the card is showing a failed contract rather than a payout.
+func is_failure() -> bool:
+	return _root.visible and _failed
 
 
 func is_showing() -> bool:
@@ -115,7 +148,8 @@ func get_explore_button() -> Button:
 	return _explore
 
 
-func show_summary(payout: Dictionary) -> void:
+func show_summary(payout: Dictionary, host: bool = true) -> void:
+	_set_mode(false, host)
 	_header.text = "CONTRACT #%04d COMPLETE" % int(payout.get("contract", 0))
 	var seconds := int(payout.get("time", 0.0))
 	_sub.text = "%s   //   TIME %02d:%02d   //   DEMON EXTRACTED" % [GameState.SITE_NAME, int(seconds / 60.0), seconds % 60]
@@ -132,7 +166,55 @@ func show_summary(payout: Dictionary) -> void:
 	_total.text = "$0"
 	_bank.text = _money(int(payout.get("bank", GameState.bank_cash)))
 	_root.visible = true
-	_next.grab_focus()
+	_focus()
+
+
+## The incident report for a lost contract: `report` comes from ContractManager.compute_report().
+func show_failure(report: Dictionary, host: bool = true) -> void:
+	_set_mode(true, host)
+	_header.text = "CONTRACT #%04d FAILED" % int(report.get("contract", 0))
+	var seconds := int(report.get("time", 0.0))
+	_sub.text = "%s   //   TIME %02d:%02d   //   CREW DOWN   //   DEMON AT LARGE" % [GameState.SITE_NAME, int(seconds / 60.0), seconds % 60]
+	for child in _rows.get_children():
+		child.queue_free()
+	for line: Variant in report.get("lines", []):
+		var note := _label("-  %s" % str(line), 15, INK)
+		note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		_rows.add_child(note)
+	_target_total = 0
+	_shown_total = 0.0
+	_total.text = "$0"
+	_bank.text = _money(GameState.bank_cash)
+	_root.visible = true
+	_focus()
+
+
+## Dresses the card as a payout (gold) or an incident report (red), and hands the first
+## button to whoever may press it: the host, or nobody.
+func _set_mode(failed: bool, host: bool) -> void:
+	_failed = failed
+	var tint := WARN if failed else GOLD
+	_card_style.border_color = tint
+	_kicker.text = "INCIDENT REPORT" if failed else "EXTRACTION REPORT"
+	_header.add_theme_color_override(&"font_color", tint)
+	_total.add_theme_color_override(&"font_color", tint)
+	_total_caption.text = "TOTAL PAYOUT"
+	_next.text = "RETRY CONTRACT" if failed else "NEXT CONTRACT"
+	_explore.text = "MAIN MENU" if failed else "KEEP EXPLORING"
+	_next.disabled = not host
+	if not host:
+		_next.text = "WAITING FOR HOST..."
+	if failed:
+		_keys.text = "[ENTER] retry contract" if host else "the host decides whether to go again"
+	else:
+		_keys.text = "[ENTER] next contract     [ESC] keep exploring" if host else "[ESC] keep exploring     the host starts the next contract"
+
+
+func _focus() -> void:
+	if _next.disabled:
+		_explore.grab_focus()
+	else:
+		_next.grab_focus()
 
 
 func hide_summary() -> void:
@@ -150,7 +232,7 @@ func _input(event: InputEvent) -> void:
 	if not _root.visible:
 		return
 	var key := event as InputEventKey
-	if key and key.pressed and not key.echo and key.physical_keycode == KEY_ESCAPE:
+	if key and key.pressed and not key.echo and key.physical_keycode == KEY_ESCAPE and not _failed:
 		get_viewport().set_input_as_handled()
 		explore_pressed.emit()
 

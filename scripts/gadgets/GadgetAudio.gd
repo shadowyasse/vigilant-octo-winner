@@ -11,6 +11,8 @@ const VOICES := 6
 const LOOPS: Array[StringName] = [&"buzz", &"rip", &"creak"]
 
 static var _streams: Dictionary = {}
+## Set by the co-op host (see NetSync): every positioned one-shot is passed on to the clients.
+static var relay: Callable = Callable()
 
 ## How often each cue fired; lets tests confirm the hooks without listening.
 var cue_counts: Dictionary = {}
@@ -37,6 +39,8 @@ func play(cue: StringName, at: Vector3 = Vector3.INF, volume_db: float = 0.0, pi
 	var stream := _stream(cue)
 	if stream == null:
 		return
+	if relay.is_valid() and at.is_finite():
+		relay.call(cue, at, volume_db, pitch)
 	if not at.is_finite():
 		_flat.stream = stream
 		_flat.volume_db = volume_db

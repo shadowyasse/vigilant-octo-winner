@@ -63,8 +63,14 @@ var player_spawn := Transform3D(Basis.IDENTITY, Vector3(1.2, 0.1, 7.5))
 var van: ExtractionVan
 var front_doors: Array[HingedDoor] = []
 var interior_doors: Array[HingedDoor] = []
-## Where Main parks the idle crew: stood around the back of the van.
-var squad_spots: Array[Transform3D] = []
+## Where each of up to four exorcists starts a contract, by seat: side by side at the kerb,
+## behind the van. Solo uses the first.
+var crew_spawns: Array[Transform3D] = [
+	Transform3D(Basis.IDENTITY, Vector3(1.2, 0.1, 7.5)),
+	Transform3D(Basis.IDENTITY, Vector3(-0.3, 0.1, 7.5)),
+	Transform3D(Basis.IDENTITY, Vector3(1.2, 0.1, 9.1)),
+	Transform3D(Basis.IDENTITY, Vector3(-0.3, 0.1, 9.1)),
+]
 ## Where the demon wakes: on the summoning circle, facing the hallway doors.
 var demon_spawn := Transform3D(Basis(Vector3.UP, PI), DAIS_CENTER + Vector3.UP * DAIS_HEIGHT)
 ## Waypoint graph the demon steers by: room centres plus both sides of every doorway.
@@ -1383,7 +1389,7 @@ func _build_van() -> void:
 	add_child(van)
 
 
-## Work site round the back of the van: tripod floodlight, and where the crew stands.
+## Work site round the back of the van: the tripod floodlight and its cable.
 func _build_van_area() -> void:
 	var tripod_at := Vector3(8.3, 0.0, -0.9)
 	var aim := Vector3(4.6, 0.9, 1.6)
@@ -1421,12 +1427,6 @@ func _build_van_area() -> void:
 	for i in cable_points.size() - 1:
 		_rod(_decor, cable_points[i], cable_points[i + 1], 0.014, cable)
 
-	squad_spots = [
-		Transform3D(Basis(Vector3.UP, deg_to_rad(250.0)), Vector3(7.0, 0.0, -0.4)),
-		Transform3D(Basis(Vector3.UP, deg_to_rad(100.0)), Vector3(1.5, 0.0, 4.6)),
-		Transform3D(Basis(Vector3.UP, deg_to_rad(165.0)), Vector3(6.3, 0.0, 8.9)),
-	]
-
 
 func _build_triggers() -> void:
 	_trigger(GameState.STEP_ENTER_HOUSE, HOUSE_WEST + 0.4, HALL_WEST - 0.4, FLOOR_Y, FLOOR_Y + 2.6, RITUAL_SPLIT + 0.4, HOUSE_SOUTH - 0.7)
@@ -1453,9 +1453,10 @@ func _trigger(step: StringName, x0: float, x1: float, y0: float, y1: float, z0: 
 			return
 		if notice.is_empty():
 			GameState.complete_step(step)
-		elif not area.has_meta(&"fired"):
+		elif body.get(&"is_local") and not area.has_meta(&"fired"):
+			# Flavour text is for whoever walked in, on their own screen.
 			area.set_meta(&"fired", true)
-			GameState.post_notice(notice))
+			GameState.post_notice_for(body, notice))
 
 
 ## Lays out the demon's waypoint graph. Doorways get a node on each side so a
@@ -1677,6 +1678,21 @@ func reset_doors() -> void:
 	for door in interior_doors:
 		door.set_open(false)
 	van.release()
+
+
+## Where the exorcist in `seat` (0-3) starts.
+func get_spawn(seat: int) -> Transform3D:
+	return crew_spawns[posmod(seat, crew_spawns.size())]
+
+
+## Every door that opens, in a fixed order: the house's, then the van's two.
+func get_doors() -> Array[HingedDoor]:
+	var doors: Array[HingedDoor] = []
+	doors.append_array(front_doors)
+	doors.append_array(interior_doors)
+	doors.append(van.left_door)
+	doors.append(van.right_door)
+	return doors
 
 
 ## Every loose prop the level spawned.
