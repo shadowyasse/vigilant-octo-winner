@@ -7,7 +7,9 @@ extends Node
 ##   - doors, the van's seal and the salt circle, as a handful of bits;
 ##   - every player: where their owner says they are, plus what the host has worked
 ##     out for them (what is in their hands, rope, arcs and tape, leash, possession).
-## Each client reports its own body and held-down inputs OWNER_RATE times a second, and
+## The snapshot travels as three small unreliable packets on their own channels (demon,
+## props, players), each well inside one MTU even with four players, so losing one never
+## costs the others. Each client reports its own body and held-down inputs OWNER_RATE times a second, and
 ## sends one-shot actions (use a door, throw, shove) as reliable commands. Clients ease
 ## everything toward the newest snapshot over one send interval, which hides the tick
 ## rate without adding more than that interval of latency.
@@ -24,7 +26,7 @@ const Parts := preload("res://scripts/gadgets/GadgetParts.gd")
 const WORLD_RATE := 20.0
 const OWNER_RATE := 30.0
 ## Most props carried by one snapshot; the rest wait their turn.
-const PROPS_PER_TICK := 28
+const PROPS_PER_TICK := 24
 const DEMON_BODIES := 11
 const DEMON_FLOATS := DEMON_BODIES * 7 + 3
 ## What a client may ask the host to do with its body, and what the host may do to a client's.
@@ -178,7 +180,11 @@ func _send_world() -> void:
 		body.write_sim_state(sim_floats, sim_ints)
 	var world := _write_world()
 	for id in clients:
-		_world.rpc_id(id, demon_floats, demon_ints, prop_ids, prop_floats, ids, owner_floats, owner_ints, sim_floats, sim_ints, world)
+		if not demon_floats.is_empty():
+			_world_demon.rpc_id(id, demon_floats, demon_ints)
+		if not prop_ids.is_empty():
+			_world_props.rpc_id(id, prop_ids, prop_floats)
+		_world_players.rpc_id(id, ids, owner_floats, owner_ints, sim_floats, sim_ints, world)
 	snapshots_sent += 1
 
 
@@ -260,7 +266,7 @@ func _send_owner_state() -> void:
 	_owner_state.rpc_id(1, floats, ints)
 
 
-@rpc("any_peer", "call_remote", "unreliable_ordered")
+@rpc("any_peer", "call_remote", "unreliable_ordered", 4)
 func _owner_state(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
 	if not is_host():
 		return
@@ -269,15 +275,24 @@ func _owner_state(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
 		body.read_owner_state(floats, 0, ints, 0)
 
 
-@rpc("authority", "call_remote", "unreliable_ordered")
-func _world(demon_floats: PackedFloat32Array, demon_ints: PackedInt32Array, prop_ids: PackedInt32Array, prop_floats: PackedFloat32Array,
-		ids: PackedInt32Array, owner_floats: PackedFloat32Array, owner_ints: PackedInt32Array,
+@rpc("authority", "call_remote", "unreliable_ordered", 1)
+func _world_demon(floats: PackedFloat32Array, ints: PackedInt32Array) -> void:
+	if active and not NetworkManager.is_authority():
+		_read_demon(floats, ints)
+
+
+@rpc("authority", "call_remote", "unreliable_ordered", 2)
+func _world_props(ids: PackedInt32Array, floats: PackedFloat32Array) -> void:
+	if active and not NetworkManager.is_authority():
+		_read_props(ids, floats)
+
+
+@rpc("authority", "call_remote", "unreliable_ordered", 3)
+func _world_players(ids: PackedInt32Array, owner_floats: PackedFloat32Array, owner_ints: PackedInt32Array,
 		sim_floats: PackedFloat32Array, sim_ints: PackedInt32Array, world: PackedInt32Array) -> void:
 	if not active or NetworkManager.is_authority():
 		return
 	snapshots_received += 1
-	_read_demon(demon_floats, demon_ints)
-	_read_props(prop_ids, prop_floats)
 	var bodies: Dictionary = _main.get(&"players")
 	for n in ids.size():
 		var body := bodies.get(ids[n]) as Player

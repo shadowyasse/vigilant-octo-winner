@@ -25,7 +25,7 @@ const LAYER_INTERACT := 8
 ## Ragdoll segments of the demon. Nothing on this layer masks it, so limbs never collide with each other.
 const LAYER_DEMON := 16
 
-## Render layer of the local player's own torso and head: the first-person camera culls it.
+## Render layer of the local player's own body: the first-person camera culls it.
 const RENDER_OWN_BODY := 1 << 12
 
 const GROUP_PLAYER := &"player"

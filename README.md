@@ -4,18 +4,23 @@ A 3D physics-based co-op comedy-horror game for Godot 4.3+. One to four
 exorcists break into a cursed house, tackle and bind a ragdoll demon, and
 shove it into the back of a van.
 
-This repository currently contains **Stages 1, 1.5, 2 and 2.5**: the cursed house and
-yard, the extraction van, the physics player controller and HUD, the CC0 model and
-PBR texture pass, the active-ragdoll demon with its poltergeist AI, knockdowns
-and drag-to-van capture, and the rigged, skinned demon model that ragdoll now wears.
-All assets live under `assets/`, so the game runs offline.
+This repository contains **Stages 1 to 4**: the cursed house and yard, the extraction
+van, the physics player controller and HUD, the CC0 model and PBR texture pass, the
+rigged active-ragdoll demon with its poltergeist AI, the three gadgets and the contract
+payout loop, and now real 2-4 player co-op, player health with downed / revive and
+second wind, friendly chaos, and demon possession. Solo is one human; co-op is two to
+four humans. There are no bots anywhere. All assets live under `assets/`, so the game
+runs offline.
 
 ## Running it
 
 1. Open the folder in Godot 4.3 or newer (Forward+ renderer) and press **F5**,
    or run `godot --path .` from the repository root.
-2. `scenes/Main.tscn` is the main scene. It holds a single node; `Main.gd`
-   builds the environment, level, player and HUD when the scene starts.
+2. The game opens on `scenes/LobbyMenu.tscn`: **PLAY SOLO**, **HOST CO-OP** or
+   **JOIN CO-OP** (see Stage 4 for the two-window test on one PC).
+3. `scenes/Main.tscn` is the contract itself. It holds a single node; `Main.gd` builds
+   the environment, the level, one exorcist per person, the HUD and the demon. Running
+   it directly (F6) starts a solo contract without going through the menu.
 
 Volumetric fog and SSAO need the Forward+ renderer. On Mobile or Compatibility
 the level still builds and plays, with the moonbeam meshes standing in for the
@@ -40,7 +45,10 @@ missing fog shafts.
 | `F` | Use doors (van rear doors, front doors) |
 | `V` | Toggle first / third person |
 | `T` | Toggle headlamp |
-| `Esc` | Release the mouse (click to recapture) |
+| `Q` | Shove: props, a conscious demon (it staggers), crewmates. 1.2 s cooldown |
+| `E` (hold, co-op) | Beside a downed crewmate: revive them (3 s, 55 HP) |
+| `Space` (mash) | Break a possession struggle, or a crewmate's rope |
+| `Esc` | Pause menu: resume, main menu / disconnect, quit |
 | `K` | Test: stun / wake the demon |
 | `J` | Test: cycle demon AI (lurking > enraged > poltergeist throw) |
 | `L` | Test: cycle bind level 0-3 |
@@ -53,16 +61,22 @@ Bindings live in **Project Settings > Input Map**.
 ## Layout
 
 ```
-project.godot            Input map, GameState autoload, physics layer names, render settings
+project.godot            Input map, autoloads, physics and render layer names, render settings
 autoload/
-  GameState.gd           Physics layer bits, groups, contract objective chain, HUD signals
+  GameState.gd           Physics layer bits, groups, contract objective chain, HUD signals, wire ids
+  NetworkManager.gd      ENet session: host / join / leave, roster (name + suit), menu <-> contract
 scenes/
-  Main.tscn              Entry scene (one node + Main.gd)
+  LobbyMenu.tscn         Title screen and co-op lobby (the project's main scene)
+  Main.tscn              The contract (one node + Main.gd)
   Player.tscn            CharacterBody3D, capsule, head, spring-arm camera, headlamp, model
   HUD.tscn               CanvasLayer + HUD.gd
   Demon.tscn             Ragdoll root (DemonRagdoll.gd) with Driver, Visuals, Audio and AI children
 scripts/
-  Main.gd                WorldEnvironment (ACES, SSAO, fog, volumetric fog, glow) and moonlight
+  Main.gd                Atmosphere and moonlight; spawns one body per person, the demon and the systems below
+  LobbyMenu.gd           Title screen over a live backdrop of the site; host / join lobby
+  NetSync.gd             Host-authoritative replication of one contract (snapshots, commands, effects)
+  PossessionSystem.gd    Salt circle, co-op possession and exorcism, the solo possession struggle
+  PauseMenu.gd           Esc menu: resume, main menu / disconnect, quit
   LevelBuilder.gd        Yard, house shell, rooms, lamps, moonbeams, markings, triggers, props
   ExtractionVan.gd       Van body, cargo cage, ramp, lights, hinged rear doors, cargo zone
   HingedDoor.gd          RigidBody3D door leaf on a HingeJoint3D with a driven swing and latch
@@ -70,10 +84,10 @@ scripts/
   OccultMarkings.gd      Procedural chalk pentagrams, rune circles, sigils and rune rows
   MaterialLibrary.gd     Cached procedural materials (noise-textured, glow, glass, shafts)
   FlickerLight.gd        Noise-driven flicker and brown-outs for any Light3D
-  Player.gd              Movement, stamina, camera modes, headlamp, grab / throw, interaction
+  Player.gd              Movement, stamina, health / downed / revive, camera, grab / throw / shove, replication
   ExorcistModel.gd       Rigged hazmat exorcist: skeletal clips plus procedural crouch, lean and arm IK
   FirstPersonArms.gd     Smooth sleeves and jointed tactical gloves shown in first person
-  HUD.gd                 Objective banner, demon status panel, stamina bar, gadget slots, prompts
+  HUD.gd                 Objective banner, demon status, health and stamina, gadget slots, conditions, crew roster
   DemonRagdoll.gd        11 collider-only rigid bodies on 10 6-DOF joints, fitted to the model's skeleton
   DemonSkeletonDriver.gd Loads the rigged .glb, sizes the ragdoll from it and poses its bones from the bodies
   DemonVisuals.gd        Charred hide shader, molten veins, ember eyes, ash and spark particles, mood
@@ -211,8 +225,8 @@ shaders/
   A conscious demon pulls back and drains stamina. `RMB` within 3.5 m of a wall, post
   or floor hammers in an anchor pin and frees your hands; an enraged demon snaps it
   after 8 - 12 s.
-- **Holy Taser** (`2`): hold `LMB` inside 3.8 m. +48 stun/s, convulsions and an electric
-  rim on the demon's skin; 32 %/s drain, 24 %/s recharge after 0.6 s, 2.8 s overheat
+- **Holy Taser** (`2`): hold `LMB` inside 3.8 m. +30 stun/s, convulsions and an electric
+  rim on the demon's skin; 25 %/s drain, 24 %/s recharge after 0.6 s, 2.8 s overheat
   lockout when run flat.
 - **Duct Tape** (`3`): hold `LMB` within 2.6 m of a stunned or anchored demon, 1.8 s per
   wrap, +20 stun each. Bind levels 1 - 3 show tape bands fitted to the skin and hung on
@@ -223,9 +237,133 @@ shaders/
   house. The bank lives in the `GameState` autoload. NEXT CONTRACT resets the site in
   place and spawns a faster, tougher demon.
 
-Quickest way to try the whole loop: `P` to summon the demon, `2` and hold `LMB` for
-about two seconds, `3` and hold `LMB` for three wraps, drag it up the ramp with `E`
-(or the lasso), then `F` on the rear doors.
+Quickest way to try the whole loop: `P` to summon the demon, `1` to rope it and `RMB`
+to pin the rope so it cannot sidestep, `2` and hold `LMB` for about three and a half
+seconds, `3` and hold `LMB` for three wraps, drag it up the ramp with `E` (or the
+lasso), then `F` on the rear doors.
+
+## Stage 4: co-op, health, possession
+
+### What changed
+
+**Visual fixes**
+
+- *First-person body clipping.* The local player's whole rig (torso with its own arms,
+  legs, boots, head, mask and harness) sits on its own render layer (13,
+  `GameState.RENDER_OWN_BODY`) and the first-person camera's `cull_mask` drops that
+  layer. Past about 20 degrees of downward look the first-person sleeves also swing down
+  with the view instead of staying pinned to the shoulders, so looking straight down
+  while taping shows forearms, gloves and tape: no chest, no shoulders, no waist. Godot
+  4.3 also drops shadow casters the camera cannot see, so each moved mesh leaves a
+  shadow-only twin on the normal layer: the body's shadow is unchanged.
+- *Taser shock.* The flat cyan-white wash is gone. The skin shader now draws a hard
+  electric-cyan Fresnel band at the silhouette and veins that crackle on and off in
+  cells re-rolled 24 times a second; nothing is added to faces turned toward the camera,
+  and the arc's own light is dimmer and held back from the target.
+- *Van seal.* The additive sigil is now an alpha-blended, lit, etched decal (scratched by
+  a grit noise) with gold emission capped near the bloom threshold. It reads as hot
+  metal cut into the rusted doors.
+
+**Balance**
+
+- Player health: 100 HP, a crimson bar above stamina, a blood edge under 40 %. Swipes
+  deal 28 HP and a knockdown; furniture the demon hurls deals 18-25 HP and a knockdown
+  (a prop anyone else threw only knocks down).
+- Downed at 0 HP: crawling, no tools, a distress beacon overhead. In co-op a standing
+  crewmate holds `E` within 2.3 m for 3 s to revive to 55 HP; everybody down at once is
+  **CONTRACT FAILED** ($0, an incident report, **RETRY CONTRACT**). Solo gets one
+  auto-injector per contract: a 2.5 s blackout, back up on 50 HP, the demon thrown
+  clear, `SECOND WIND USED - NO MORE REVIVES`. The second time is CONTRACT FAILED.
+- Taser: 30 stun/s (was 48), four seconds of trigger per battery. After ~35 stun while
+  conscious the demon evades: a sideways shadow lunge, blowing every lamp within 10 m
+  for 6-8 s, or a snap poltergeist throw. For 4 s after waking, stun builds at half rate.
+- Mid-haul breakout: a stunned demon being hauled with 0 or 1 wraps builds hidden
+  tension (about 6.5 s / 10 s of hauling) and then rips a layer of tape off, throws the
+  haulers back and loses 25 stun. Two wraps last about 28 s; three hold.
+- Crew scaling (`DemonAI.set_player_count`, recomputed when anyone leaves):
+
+  | Players | Stun resistance | Struggle force | Drag mass | Speed | Swipe rate | Throw rate |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 1 | x1.00 | x1.00 | x1.00 | x1.00 | x1.00 | x1.00 |
+  | 2 | x1.45 | x1.25 | x1.35 | x1.05 | x1.12 | x1.15 |
+  | 3 | x1.85 | x1.45 | x1.65 | x1.10 | x1.24 | x1.30 |
+  | 4 | x2.20 | x1.60 | x1.90 | x1.15 | x1.36 | x1.45 |
+
+**No bots.** The three showcase exorcists that stood around the yard are gone, along
+with the `showcase` mode of `ExorcistModel`. `Main` spawns one body per person in the
+session and nothing else.
+
+**Friendly chaos**
+
+- Holy Taser on a crewmate: 0 damage, 2.5 s of cartwheeling with sparks and a rolling
+  camera, and whatever they held is dropped.
+- Holy Lasso on a crewmate: they are leashed to you (hold `LMB` to reel them in), and
+  `RMB` pins them to a wall or post. They get out by mashing `Space` six times, or
+  with `R` after two seconds.
+- `Q` shove: props fly, a conscious demon staggers for half a second, a crewmate is
+  sent off the van ramp.
+- Two or more players hauling the demon (by hand or on a held rope) each get +20 %
+  pull per extra hauler and the HUD shows `CO-OP DRAG x2`.
+
+**Possession** (`scripts/PossessionSystem.gd`)
+
+- A salt circle lies on the driveway beside the van.
+- Co-op: every 35-45 s, if the demon is within 2.8 m of a player who is alone (nobody
+  within 7 m) or under 30 % stamina, or it has just woken with one wrap or none, it
+  vanishes into them. Their visor burns, ash pours off the suit, the screen pulses
+  crimson, controls twitch and invert, and their arms shove any crewmate who comes
+  within 2.3 m. The banner reads `> EXORCISE [NAME]! Tase or drag to Salt Circle!`.
+  1.5 s of taser, or walking / dragging them into the circle, throws the demon out
+  STUNNED. Left alone for 40 s it climbs out by itself, awake.
+- Solo: the same attack is a 2.5 s POSSESSION STRUGGLE. Ten presses of `Space` break
+  it; failing costs 30 HP and whatever was in hand.
+
+### Network model
+
+`NetworkManager` (autoload) owns the `ENetMultiplayerPeer`, the roster and the scene
+flow. `NetSync` (a child of `Main`) replicates one contract:
+
+- The host simulates the demon (ragdoll and brain), every prop, the doors and van, the
+  contract and the possession rules. It sends a snapshot 20 times a second as three
+  unreliable packets on separate channels (demon, moved props only, players), each
+  inside one MTU with four players.
+- Each client owns its own movement and camera and reports them 30 times a second
+  together with the buttons it holds. The host works that player's hands and gadgets
+  from those inputs on its copy of the body and sends the results back, so ropes, arcs,
+  tape and grabs act on the one real world. One-shot actions (doors, throw, shove) are
+  reliable commands.
+- Clients ease every body toward the newest snapshot over one send interval.
+- A client leaving is removed from every site, its ropes and grabs let go, and the
+  demon re-scaled. The host leaving returns every client to its title screen.
+
+### Trying it solo
+
+1. `godot --path .`, then **PLAY SOLO**. You spawn alone at the kerb on contract #0413.
+2. `P` summons the demon in front of you. Let it swipe you (28 HP each) until the bar
+   empties: **second wind** blacks the screen out for 2.5 s and stands you up on 50 HP.
+   Let it empty the bar again for **CONTRACT FAILED** and **RETRY CONTRACT**.
+3. For the **possession struggle**, stay within arm's reach of the enraged demon once
+   it has been found; an attempt comes every 35-45 s. Mash `Space`.
+4. `2` and hold `LMB` on the demon to see the cyan rim and the evasions; `K` stuns it,
+   then drag it with `E` untaped to feel a breakout.
+
+### Trying two-player co-op on one PC
+
+1. Start two instances: run `godot --path .` twice (or, in the editor, *Debug > Customize
+   Run Instances > Enable Multiple Instances*, 2, then F5).
+2. Window A: **HOST CO-OP**. The lobby opens on port `7777` and lists you as seat 1.
+   Pick a name and a suit colour.
+3. Window B: **JOIN CO-OP**. Leave the address at `127.0.0.1` and the port at `7777`,
+   pick a different suit, **CONNECT**. Both rosters now show two players.
+4. Window A: **START CONTRACT**. Both windows load the site with two exorcists.
+5. Things to try: tase each other (`2`), rope each other (`1`, then `RMB` at a porch
+   column), `Q` each other off the ramp, both grab the stunned demon (`K` on the host,
+   then `E`), let one player go down and hold `E` on them, and wander off alone near
+   the enraged demon to get possessed. The test keys work on the host only.
+6. `Esc` > **DISCONNECT & MAIN MENU** in window B leaves cleanly; window A carries on.
+
+For another machine on the LAN, give the joiner the **LOCAL IP** shown in the host's
+lobby and allow UDP port 7777 through the host's firewall.
 
 ## Checks
 
@@ -234,10 +372,18 @@ godot --headless --path . --import          # first run only: builds the import 
 godot --headless --path . -s tools/validate_project.gd
 godot --headless --fixed-fps 60 --path . -s tools/smoke_test.gd
 godot --headless --fixed-fps 60 --path . -s tools/stage3_test.gd
+godot --headless --fixed-fps 60 --path . -s tools/stage4_test.gd
+tools/run_net_test.sh                       # a host and a client on 127.0.0.1
 ```
 
-`validate_project.gd` compiles every script, loads every scene and shader and checks
-every `res://` path. `stage3_test.gd` works the three gadgets through real input; the
+`validate_project.gd` compiles every script, loads every scene and shader, checks
+every `res://` path and confirms the autoloads (`GameState`, `NetworkManager`,
+`ModelLoader`) are live. `stage4_test.gd` covers Stage 4 solo: no NPCs, the own-body
+render layer, the seal, damage, second wind, CONTRACT FAILED and RETRY, the shove,
+evasion, shock resistance, breakout, crew scaling, the possession struggle and the
+pause menu. `run_net_test.sh` starts two headless instances, a host and a client, and
+checks both sides of the lobby, replication, friendly fire, the rope on a crewmate,
+revive, possession and the salt circle, the wipe and retry, and a clean disconnect. `stage3_test.gd` works the three gadgets through real input; the
 smoke test now also covers the seal, the payout card and the next contract.
 
 The smoke test boots the real game and plays the contract through the player's own

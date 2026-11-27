@@ -1229,7 +1229,7 @@ func _finish_second_wind() -> void:
 	for demon in get_tree().get_nodes_in_group(GameState.GROUP_DEMON):
 		if demon.has_method(&"blast_away"):
 			demon.call(&"blast_away", global_position, 7.0, 6.0)
-	GameState.post_notice_for(self, "SECOND WIND USED  -  NO MORE REVIVES")
+	GameState.post_notice_for(self, "SECOND WIND USED — NO MORE REVIVES")
 
 
 ## Second wind, possession and the leash, on the machine that owns the body.

@@ -37,6 +37,9 @@ const CLIP_FALL := CLIP_PREFIX + "Death"
 const CROUCH_DROP := 0.5
 ## The rig's arms are short; first-person hands borrow some length to sit in frame.
 const FIRST_PERSON_ARM_STRETCH := 0.35
+## Downward look (radians) over which the first-person sleeves go from shoulder-anchored to swinging with the view.
+const VIEW_TUCK_FROM := 0.35
+const VIEW_TUCK_FULL := 0.9
 const SIDES: Array[String] = ["L", "R"]
 ## Centre of the palm in a first-person glove's own frame.
 const PALM_OFFSET := Vector3(0.0, -0.02, -0.08)
@@ -179,7 +182,7 @@ func get_palm_position(side: int = 1) -> Vector3:
 	return get_hand_position(side)
 
 
-## In first person the gloves follow the view. The torso, head and harness are not hidden
+## In first person the gloves follow the view. The body, head and harness are not hidden
 ## here: the local player's sit on their own render layer (see `set_local_body`) and the
 ## first-person camera simply does not draw that layer.
 func set_first_person(enabled: bool) -> void:
@@ -191,10 +194,10 @@ func set_first_person(enabled: bool) -> void:
 		part.visible = not enabled
 
 
-## Marks this model as the one the local camera looks out of. Its torso (with the rig's own
-## arms), head, mask and harness move to GameState.RENDER_OWN_BODY, which the first-person
-## camera culls, so looking straight down never shows the inside of the chest. Legs and
-## boots stay on the normal layer. Godot 4.3 drops shadow casters the camera cannot see,
+## Marks this model as the one the local camera looks out of. The whole rig (torso with its
+## own arms, legs, boots, head, mask and harness) moves to GameState.RENDER_OWN_BODY, which
+## the first-person camera culls, so looking straight down never shows the inside of the
+## chest or a severed waist. Godot 4.3 drops shadow casters the camera cannot see,
 ## so each moved mesh leaves a shadow-only twin behind on the normal layer.
 func set_local_body() -> void:
 	if _local_body:
@@ -202,7 +205,7 @@ func set_local_body() -> void:
 	_local_body = true
 	var parts: Array[GeometryInstance3D] = []
 	for mesh in _body_meshes:
-		if mesh.name.contains("Body") and not _head_parts.has(mesh):
+		if not _head_parts.has(mesh):
 			parts.append(mesh)
 	parts.append_array(_head_parts)
 	parts.append_array(_chest_gear)
@@ -417,6 +420,18 @@ func _apply_pose(skeleton: Skeleton3D) -> void:
 			var upper_arm := _bone("UpperArm.%s" % side)
 			var shoulder := skeleton.global_transform * skeleton.get_bone_global_pose(upper_arm).origin
 			var elbow := skeleton.global_transform * skeleton.get_bone_global_pose(_bone("LowerArm.%s" % side)).origin
+			# Looking down would bring the real shoulders and elbows up under the lens. The
+			# sleeves swing down with the view instead, so they enter the frame from below as
+			# they do when looking level: forearms and gloves, never a shoulder.
+			var dip := asin(clampf(-_view.basis.z.normalized().y, -1.0, 1.0))
+			var swing := smoothstep(VIEW_TUCK_FROM, VIEW_TUCK_FULL, -dip)
+			if swing > 0.001:
+				var axis := _view.basis.x.normalized()
+				var upper_length := shoulder.distance_to(elbow)
+				var lower_length := elbow.distance_to(_hand_world[i])
+				shoulder = _view.origin + (shoulder - _view.origin).rotated(axis, dip * swing)
+				var bend := (_view.basis.orthonormalized() * Vector3(sign * 0.7, -0.8, 0.35)).rotated(axis, dip * (swing - 1.0))
+				elbow = elbow.lerp(_bend_point(shoulder, _hand_world[i], upper_length, lower_length, bend), swing)
 			var hand := _hand_basis(sign, elbow, _hand_world[i])
 			if held > 0.001:
 				hand = Basis(hand.get_rotation_quaternion().slerp(_tool_palm[i].basis.get_rotation_quaternion(), held))
@@ -528,6 +543,22 @@ func _solve_limb(skeleton: Skeleton3D, upper: int, lower: int, tip: int, target:
 	b = skeleton.get_bone_global_pose(lower).origin
 	c = skeleton.get_bone_global_pose(tip).origin
 	_aim_bone(skeleton, lower, c - b, a + direction * distance - b)
+
+
+## Where a two-bone limb of these lengths bends between `from` and `to`, leaning toward `pole`.
+func _bend_point(from: Vector3, to: Vector3, upper_length: float, lower_length: float, pole: Vector3) -> Vector3:
+	var span := to - from
+	var reach := span.length()
+	if reach < 1e-5:
+		return from + pole.normalized() * upper_length
+	var direction := span / reach
+	var distance := clampf(reach, absf(upper_length - lower_length) * 1.02, (upper_length + lower_length) * 0.998)
+	var along := (upper_length * upper_length + distance * distance - lower_length * lower_length) / (2.0 * distance)
+	var out := sqrt(maxf(0.0, upper_length * upper_length - along * along))
+	var bend := pole - direction * pole.dot(direction)
+	if bend.length_squared() < 1e-8:
+		bend = direction.cross(Vector3.RIGHT)
+	return from + direction * along + bend.normalized() * out
 
 
 class PoseModifier extends SkeletonModifier3D:

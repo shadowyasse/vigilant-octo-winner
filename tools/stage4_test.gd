@@ -218,17 +218,21 @@ func _test_first_person_layers() -> void:
 	var own := int(root.get_node("GameState").get("RENDER_OWN_BODY"))
 	var body: MeshInstance3D = null
 	var legs: MeshInstance3D = null
+	var feet: MeshInstance3D = null
 	for mesh: MeshInstance3D in model.get("_body_meshes"):
 		if String(mesh.name) == "Worker_Body":
 			body = mesh
 		elif String(mesh.name) == "Worker_Legs":
 			legs = mesh
+		elif String(mesh.name) == "Worker_Feet":
+			feet = mesh
 	var head_ok := true
 	for part: GeometryInstance3D in model.get("_head_parts"):
 		if part.layers != own:
 			head_ok = false
 	_check("torso and head meshes sit on the own-body render layer", body != null and body.layers == own and head_ok, "body layers %d" % (body.layers if body else -1))
-	_check("legs stay on the normal layer", legs != null and legs.layers == 1)
+	_check("so do the legs and boots, each with a shadow twin", legs != null and legs.layers == own and feet != null and feet.layers == own
+			and legs.get_parent().has_node("Worker_LegsShadow") and feet.get_parent().has_node("Worker_FeetShadow"))
 	var twin := body.get_parent().get_node_or_null("Worker_BodyShadow") as MeshInstance3D
 	_check("a shadow-only twin on the normal layer keeps the torso's shadow", twin != null and twin.layers == 1
 			and twin.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY and twin.mesh == body.mesh and twin.skin == body.skin)
@@ -244,10 +248,19 @@ func _test_first_person_layers() -> void:
 			if (part as MeshInstance3D).layers & own != 0:
 				arms_ok = false
 	_check("the first-person arms are shown and are not on the culled layer", arms_ok)
-	# Straight down, as when taping a demon at your feet: nothing of the torso can be in view.
+	# Straight down, as when taping a demon at your feet: nothing of the body can be in view,
+	# and the sleeves swing down with the lens rather than filling it with shoulders.
+	_tap(KEY_3)
 	_player.set("_pitch", -1.4)
-	await _frames(10)
+	await _frames(45)
 	_check("looking straight down leaves the cull in place", camera.get_cull_mask_value(13) == false)
+	var crowding: Array[String] = []
+	for joint: String in ["_shoulder", "_elbow"]:
+		for ball: MeshInstance3D in arms.get(joint):
+			if camera.is_position_in_frustum(ball.global_position):
+				crowding.append("%s %.2f m" % [joint, ball.global_position.distance_to(camera.global_position)])
+	_check("...and no sleeve shoulder or elbow is in frame, only forearms and gloves", crowding.is_empty(), str(crowding))
+	_tap(KEY_0)
 	_player.set("_pitch", 0.0)
 	_player.call("set_first_person", false)
 	await _frames(40)

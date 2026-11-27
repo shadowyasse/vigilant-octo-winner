@@ -28,9 +28,9 @@ const PANEL := Color(0.025, 0.032, 0.04, 0.9)
 const STEEL := Color(0.2, 0.24, 0.27)
 const SUIT_SWATCHES: Array[Color] = [Color(0.86, 0.34, 0.06), Color(0.05, 0.50, 0.50), Color(0.38, 0.42, 0.17), Color(0.40, 0.20, 0.58)]
 ## The camera looks at this point while it tracks from one end of its rail to the other.
-const LOOK_AT := Vector3(1.0, 2.1, -3.5)
-const RAIL_FROM := Vector3(7.4, 2.5, 11.6)
-const RAIL_TO := Vector3(11.8, 3.1, 9.4)
+const LOOK_AT := Vector3(1.5, 1.7, -2.5)
+const RAIL_FROM := Vector3(9.6, 3.1, 12.7)
+const RAIL_TO := Vector3(13.8, 3.9, 10.4)
 
 var page: Page = Page.TITLE
 

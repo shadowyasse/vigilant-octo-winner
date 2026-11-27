@@ -228,6 +228,11 @@ func _host() -> void:
 	var answered := await _acked()
 	_check("the client's movement shows up on the host", answered and _other.global_position.distance_to(before) > 2.0, "moved %.2f m" % _other.global_position.distance_to(before))
 	_check("a client's one-shot command (shove) is executed by the host", float(_other.get("_shove_left")) > 0.0, "cooldown %.2f" % float(_other.get("_shove_left")))
+	_phase("gadget")
+	answered = await _acked()
+	var their_taser := _other.get("gadgets").get("taser") as Node
+	_check("a client's held trigger works its gadget on the host", answered and float(their_taser.get("zap_time")) > 0.3 and float(their_taser.get("battery")) < 100.0,
+			"%.2f s of trigger, battery %.0f" % [float(their_taser.get("zap_time")), float(their_taser.get("battery"))])
 	_phase("home")
 	await _acked()
 	await _frames(20)
@@ -427,6 +432,19 @@ func _client() -> void:
 	_action(&"shove")
 	await _frames(15)
 	_check("walking is local and immediate", _player.global_position.distance_to(spawn) > 2.5, "%.2f m" % _player.global_position.distance_to(spawn))
+	_ack_phase()
+	# --- this player's own gadget: the trigger is held here, the taser is worked on the host
+	await _await_phase("gadget")
+	_tap(KEY_2)
+	await _frames(40)
+	Input.action_press(&"gadget_fire")
+	await _frames(45)
+	var own_taser := _player.get("gadgets").get("taser") as Node
+	_check("own taser: firing, arcs drawn and the battery draining, all via the host", own_taser.get("firing") == true and float(own_taser.get("battery")) < 95.0
+			and (own_taser.get("_bolts") as MeshInstance3D).visible and float(_player.get("gadgets").call("get_battery")) < 0.95, "battery %.0f" % float(own_taser.get("battery")))
+	Input.action_release(&"gadget_fire")
+	_tap(KEY_2)
+	await _frames(10)
 	_ack_phase()
 	await _await_phase("home")
 	_teleport(_player, spawn)
