@@ -169,6 +169,8 @@ var _struggle_left := 1.0
 var _strain := 0.0
 var _snag_time := 0.0
 var _holders: Dictionary = {}
+## Knocked off balance: for this long its legs do not fight whatever velocity it was given.
+var _reel_left := 0.0
 ## Lasso -> true when that rope is pinned to an anchor, false while a player holds it.
 var _ropes: Dictionary = {}
 var _safe := Transform3D.IDENTITY
@@ -371,6 +373,7 @@ func shove(direction: Vector3, by: Node = null) -> void:
 		nudge(push * 1.6)
 		return
 	nudge(push * 2.6 + Vector3.UP * 0.6)
+	_reel_left = 0.3
 	staggered.emit(by)
 
 
@@ -378,7 +381,10 @@ func shove(direction: Vector3, by: Node = null) -> void:
 func blast_away(from: Vector3, speed: float, stun: float = 0.0) -> void:
 	var away := (get_center() - from) * Vector3(1.0, 0.0, 1.0)
 	away = away.normalized() if away.length_squared() > 0.001 else get_facing()
-	nudge(away * speed + Vector3.UP * 1.6)
+	# The whole body goes, not just its core, and its legs do not get a say for a moment.
+	for part in _bodies.size():
+		_bodies[part].apply_central_impulse((away * speed + Vector3.UP * 1.6) * PART_MASS[part])
+	_reel_left = 0.55
 	if stun > 0.0:
 		add_stun(stun)
 	staggered.emit(null)
@@ -702,6 +708,7 @@ func _physics_process(delta: float) -> void:
 		return
 	_time += delta
 	shock_resist_left = maxf(0.0, shock_resist_left - delta)
+	_reel_left = maxf(0.0, _reel_left - delta)
 	_thud_left = maxf(0.0, _thud_left - delta)
 	_shock_left = maxf(0.0, _shock_left - delta)
 	_convulse_left -= delta
@@ -748,6 +755,8 @@ func _tick_active(delta: float) -> void:
 		# Locomotion: the full body mass is behind it, so clutter in the way gets kicked aside.
 		var wish := Vector3(move_direction.x, 0.0, move_direction.z).limit_length(1.0) * move_speed
 		var push := ((wish - planar) * MOVE_RESPONSE).limit_length(MAX_MOVE_ACCELERATION) * _total_mass * _support
+		if _reel_left > 0.0:
+			push = Vector3.ZERO
 		pelvis.apply_central_force(push * 0.55)
 		torso.apply_central_force(push * 0.45)
 

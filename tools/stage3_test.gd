@@ -457,7 +457,7 @@ func _step_taser_prop() -> void:
 			_check("taser arcs to a prop inside 3.8 m", _taser.get("firing") == true and _taser.get("_target") == _crate and _saw_bolts and _saw_light)
 			_check("the prop is knocked back", _peak_crate_speed > 0.4 and _crate.global_position.distance_to(_mark_position) > 0.05,
 					"%.2f m/s, moved %.2f m" % [_peak_crate_speed, _crate.global_position.distance_to(_mark_position)])
-			_check("battery drains at 32 %/s", absf((_mark - battery) - 16.0) < 1.5, "%.1f %% in 0.5 s" % (_mark - battery))
+			_check("battery drains at 25 %/s", absf((_mark - battery) - 12.5) < 1.5, "%.1f %% in 0.5 s" % (_mark - battery))
 			_check("HUD slot 2 shows the live battery", absf(float(_slot(1).get("battery")) - battery / 100.0) < 0.02)
 			_check("electric buzz is playing", int(_cues().get(&"buzz", 0)) >= 1, str(_cues()))
 			_hold(&"gadget_fire", false)

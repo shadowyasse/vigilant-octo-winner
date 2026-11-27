@@ -157,6 +157,8 @@ var _crew := 1
 var _evade_next := 35.0
 var _stagger_left := 0.0
 var _hold_left := 0.0
+var _lunge_left := 0.0
+var _lunge_direction := Vector3.ZERO
 
 
 ## Wires the brain to the level and its prey. Called by Main after everything exists.
@@ -382,6 +384,13 @@ func _physics_process(delta: float) -> void:
 		_ragdoll.pose = Ragdoll.Pose.CAST
 		_look_at_player(true)
 		_halt()
+		_face(_player.global_position)
+	elif _lunge_left > 0.0 and not _ragdoll.is_stunned:
+		# Mid shadow-lunge: flat out sideways, eyes still on whoever is holding the taser.
+		_lunge_left -= delta
+		_ragdoll.pose = Ragdoll.Pose.CHASE
+		_ragdoll.move_direction = _lunge_direction
+		_ragdoll.move_speed = 9.0
 		_face(_player.global_position)
 	elif _stagger_left > 0.0 and not _ragdoll.is_stunned and state != State.POLTERGEIST_THROW:
 		_halt()
@@ -824,7 +833,10 @@ func _sidestep() -> void:
 		side = -side
 	if _blocked(chest, chest + side * 2.6, WALK_MASK):
 		side = -side
-	_ragdoll.nudge(side * 7.5 - from_player * 1.5 + Vector3.UP * 1.1)
+	_ragdoll.nudge(side * 6.0 + Vector3.UP * 1.1)
+	_lunge_direction = side
+	_lunge_left = 0.42
+	_stagger_left = 0.0
 	_swipe_left = minf(_swipe_left, 0.25)
 	_route.clear()
 	_repath_left = 0.0
